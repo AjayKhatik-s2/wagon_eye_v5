@@ -1,0 +1,772 @@
+================================================================================
+        WAGON EYE — PHASE 1 STANDALONE WAGON COUNT — PIPELINE WORKFLOW
+================================================================================
+  Package : wagon_count/
+  Scope   : ONLY  exact global wagon counting + classification +
+                  cross-camera synchronization + per-wagon frame extraction
+  NOT     : doors / damage / OCR / loaded-empty / PDF / email / S3 upload
+================================================================================
+
+  PURPOSE
+  -------
+  Take 4 synchronized train videos from 4 fixed CCTVs at the railway
+  track and produce ONE globally synchronized train state in which:
+
+      total_wagons is exact
+      every wagon has a deterministic global id  (GW_1, GW_2, ..., GW_N)
+      every wagon has a single authoritative classification:
+          ENGINE | WAGON | BRAKE_VAN
+      the SAME GW_n across all 4 cameras refers to the SAME physical wagon
+      the per-wagon frame folders downstream phases will consume are written
+      to disk under  results/frames/{CAMERA}/{GW_n}/
+
+  RIGHT_UP is the MASTER CAMERA.  Its gap detections and classifications
+  are authoritative.  The other 3 cameras only contribute *temporal
+  evidence* — their job is to recover gaps that RIGHT_UP missed, not to
+  override anything RIGHT_UP got right.
+
+
+================================================================================
+  INPUTS
+================================================================================
+
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  4 trimmed train videos  (same t=0 alignment, trimmed by upstream) │
+  │      inputs/right_up.mp4         ★ master ★                       │
+  │      inputs/left_up.mp4                                            │
+  │      inputs/right_up_top.mp4                                       │
+  │      inputs/left_up_top.mp4                                        │
+  │                                                                    │
+  │  4 YOLO weight files                                               │
+  │      models/right_up_wagon_gap.pt     RIGHT_UP (master) gap model  │
+  │      models/left_up_wagon_gap.pt      LEFT_UP gap model            │
+  │      models/top_gap.pt                both top cameras             │
+  │      models/side_classification.pt    RIGHT_UP only — class auth   │
+  └────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+  PACKAGE LAYOUT
+================================================================================
+
+  wagon_count/
+  ├── run_global_count.py      ★ entry point (CLI + auto-discovery)
+  ├── tracker_engine.py        per-camera gap tracking + master classifier
+  ├── global_alignment.py      cross-camera fusion (Phase-1 only)
+  ├── video_segmenter.py       overlay rendering + per-wagon JPEG extraction
+  ├── global_train_state.py    canonical data contracts (dataclasses)
+  ├── RUN_WAGON_COUNT.ipynb    interactive runbook (same flow as the CLI)
+  ├── README.md                deployment + usage docs
+  ├── requirements.txt
+  ├── inputs/                  ← drop the 4 .mp4 here
+  └── models/                  ← drop the 3 .pt here
+
+
+================================================================================
+  ARCHITECTURE OVERVIEW
+================================================================================
+
+   ┌────────────────────────────────────────────────────────────────────┐
+   │                       run_global_count.py                          │
+   │                                                                    │
+   │   ONE Python process. Linear pipeline.  No threads. No S3. No DB.  │
+   │     1. resolve inputs + models  (./inputs and ./models defaults)   │
+   │     2. per-camera gap tracking  (4 sequential calls)               │
+   │     3. RIGHT_UP master classification (ENGINE/WAGON/BRAKE_VAN)     │
+   │     4. cross-camera gap fusion                                     │
+   │     5. write GlobalTrainState JSON                                 │
+   │     6. render overlay video per camera                             │
+   │     7. extract per-wagon frame folders per camera                  │
+   │     8. print summary table                                         │
+   └────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+  COMPONENT MAP
+================================================================================
+
+  ┌──────────────────────────┬───────────────────────────────────────────┐
+  │ Module                   │ What it provides                          │
+  ├──────────────────────────┼───────────────────────────────────────────┤
+  │ run_global_count.py      │ CLI parser, file resolution, step orches- │
+  │                          │ tration, summary print, JSON dump.        │
+  ├──────────────────────────┼───────────────────────────────────────────┤
+  │ tracker_engine.py        │ GapTracker  — YOLO + 1-D Kalman filter on │
+  │                          │   bbox center_x, hit/miss persistence,    │
+  │                          │   emits a confirmed GapEvent per track.   │
+  │                          │ MasterClassifier — RIGHT_UP majority-vote │
+  │                          │   ENGINE/WAGON/BRAKE_VAN classifier.      │
+  │                          │ segments_from_gaps() helper.              │
+  ├──────────────────────────┼───────────────────────────────────────────┤
+  │ global_alignment.py      │ Phase-1 fusion only:                      │
+  │                          │   match_support_to_master                 │
+  │                          │   cluster_unmatched_supports              │
+  │                          │   decide_inserted_gaps                    │
+  │                          │   fuse_master_timeline                    │
+  │                          │   build_global_wagons                     │
+  │                          │   build_wagons_pure_master  (fallback)    │
+  │                          │   assemble_global_train_state             │
+  ├──────────────────────────┼───────────────────────────────────────────┤
+  │ video_segmenter.py       │ render_processed_video()                  │
+  │                          │   draws YELLOW interpolated tracked-gap   │
+  │                          │   bbox every frame in the gap span +      │
+  │                          │   CYAN raw YOLO detections on top +       │
+  │                          │   MAGENTA wagon-boundary flash +          │
+  │                          │   info panel (camera, GW_n, class, conf). │
+  │                          │ extract_wagon_frames()                    │
+  │                          │   writes JPEG per frame into              │
+  │                          │   output/{CAMERA}/{GW_n}/                 │
+  ├──────────────────────────┼───────────────────────────────────────────┤
+  │ global_train_state.py    │ Canonical dataclasses:                    │
+  │                          │   GapEvent, LocalCameraTracks,            │
+  │                          │   _MasterClassification, GlobalWagon,     │
+  │                          │   GapCorrection, GlobalTrainState,        │
+  │                          │   SegmentClass enum.                      │
+  └──────────────────────────┴───────────────────────────────────────────┘
+
+
+================================================================================
+================================================================================
+                           STEP-BY-STEP WORKFLOW
+================================================================================
+================================================================================
+
+
+================================================================================
+  STEP 0 — INPUT / MODEL RESOLUTION  (run_global_count.py)
+================================================================================
+
+  CLI defaults are designed for "drop files and run":
+
+      python run_global_count.py
+
+  Looks first in --inputs-dir (default ./inputs) for the 4 expected
+  filenames, with case + 'cam_' fallback patterns:
+
+      RIGHT_UP      → right_up.mp4    | RIGHT_UP.mp4    | cam_right_up.mp4
+      LEFT_UP       → left_up.mp4     | LEFT_UP.mp4     | cam_left_up.mp4
+      RIGHT_UP_TOP  → right_up_top.mp4| RIGHT_UP_TOP.mp4| cam_right_up_top.mp4
+      LEFT_UP_TOP   → left_up_top.mp4 | LEFT_UP_TOP.mp4 | cam_left_up_top.mp4
+
+  Looks in --models-dir (default ./models) for:
+      right_up_wagon_gap.pt
+      left_up_wagon_gap.pt
+      top_gap.pt
+      side_classification.pt
+
+  Either everything is found (run continues) or a clean FileNotFoundError
+  exit code 2 with a "looked here, drop file there" message.
+
+
+================================================================================
+  STEP 1 — PER-CAMERA GAP TRACKING   (tracker_engine.GapTracker)
+================================================================================
+
+  For each of the 4 cameras, in fixed order RIGHT_UP → LEFT_UP →
+  RIGHT_UP_TOP → LEFT_UP_TOP, we call:
+
+      GapTracker(camera_id, model_path, confidence).process_video(video)
+
+  Per frame:
+
+      ┌──────────────────────────────────────────────────────────────────┐
+      │  raw_frame = cap.read()                                          │
+      │  yolo_dets = self.model(raw_frame)  ← right_up/left_up gap or  │
+      │                                       top_gap, by camera       │
+      │  filter:                                                         │
+      │      keep class_name == 'gap'                                    │
+      │      keep confidence >= self.confidence                          │
+      │      keep bbox height >= self.min_height_ratio * frame_h         │
+      │                                                                  │
+      │  for each surviving detection:                                   │
+      │     associate to nearest active track by |dx| <= match_distance  │
+      │     if no match: open a new track                                │
+      │     each track has:                                              │
+      │        first_frame, last_seen_frame                              │
+      │        Kalman filter on bbox center_x (constant velocity)        │
+      │        hit_count, miss_count                                     │
+      │        confidences[], centers[]                                  │
+      │        hit_frames[]  — frame indices of each hit  (Phase-1.1)    │
+      │        bbox_history[] — bbox [x1,y1,x2,y2] per hit (Phase-1.1)   │
+      │     tracks with hit_count >= min_hits become 'confirmed'         │
+      │     tracks with miss_count >= max_miss are closed (kept if conf) │
+      │                                                                  │
+      │  also stash raw_frame_detections[frame_idx] = [{bbox, conf}, ...]│
+      │     (used by the overlay renderer for cyan boxes)                │
+      └──────────────────────────────────────────────────────────────────┘
+
+  After the loop we sort confirmed tracks by first_frame and re-issue
+  monotonic track_ids 1..N for determinism, then emit one GapEvent per
+  track:
+
+      GapEvent {
+          track_id, camera_id,
+          start_frame,    end_frame,           # span (last_seen - first)
+          confidence,                          # mean of per-hit conf
+          hit_count, fps,
+          center_x_trajectory: [...]           # Kalman cx per hit
+          hit_frames:          [...]           # frame idx per hit
+          bbox_history:        [...]           # bbox per hit
+          temporal_consistency_score           # hit_count / span_frames
+      }
+
+  Returned wrapped in a LocalCameraTracks:
+
+      LocalCameraTracks {
+          camera_id, video_path, fps, total_frames, width, height,
+          gaps: [GapEvent, ...],
+          raw_frame_detections: {frame_idx -> [{bbox, conf, cx}, ...]},
+          classifications: []        # filled only for RIGHT_UP in step 2
+      }
+
+  Tuning knobs (per-tracker constructor):
+
+      confidence         default 0.4
+      min_height_ratio   default 0.35    bbox height vs frame height
+      match_distance_px  default 80.0    |dx| for track association
+      min_hits           default 3       persistence to confirm a track
+      max_miss           default 30      frames of no-detection -> close
+
+
+================================================================================
+  STEP 2 — RIGHT_UP MASTER CLASSIFICATION   (tracker_engine.MasterClassifier)
+================================================================================
+
+  RIGHT_UP is the only classification authority.
+
+  Build the pre-fusion segment list from RIGHT_UP's gaps:
+
+      segments_from_gaps(gaps, total_frames) →
+          [(0, gap1_center - 1),
+           (gap1_center, gap2_center - 1),
+           ...,
+           (gapN_center, total_frames - 1)]
+
+  Each segment is sampled at N evenly-spaced frame indices (default
+  N = 5, 10% margin from boundaries), each frame is classified by
+  side_classification.pt:
+
+      classifier returns top1 label & confidence
+      labels are mapped to canonical SegmentClass:
+          'engine' / 'loco' / ...         → ENGINE
+          'tail'   / 'brake_van' / ...    → BRAKE_VAN
+          'track'  / 'background' / ...   → UNKNOWN  (rare, drops)
+          everything else                 → WAGON
+      majority-vote across the N samples; conf = mean of votes for winner
+
+  Output:  initial_classifications = [_MasterClassification, ...]
+
+      _MasterClassification {
+          segment_index, start_frame, end_frame, label, confidence
+      }
+
+  Tuning knobs:
+      --classification-samples N    default 5
+
+
+================================================================================
+  STEP 3 — CROSS-CAMERA GAP FUSION   (global_alignment.fuse_master_timeline)
+================================================================================
+
+  Goal: insert into the master gap list any gap that RIGHT_UP missed but
+  that two or more support cameras independently saw.  We DO NOT remove
+  master gaps; RIGHT_UP can only be augmented, never overridden.
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Step 3a — match_support_to_master                                  │
+  │                                                                     │
+  │  For each support camera (LEFT_UP, RIGHT_UP_TOP, LEFT_UP_TOP):      │
+  │    for each support gap, compute the best score against every       │
+  │    master gap:                                                      │
+  │        score = max(temporal_IoU, 1 - |Δt| / match_time_window_sec)  │
+  │    accept the match if  IoU >= match_min_iou  OR  |Δt| <= window.   │
+  │  Returns:                                                           │
+  │    matched   : {support.track_id -> master.track_id}                │
+  │    leftover  : support gaps with no master match                    │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Step 3b — cluster_unmatched_supports                               │
+  │                                                                     │
+  │  Pool all leftover support gaps across the 3 cameras and sort by    │
+  │  center_time.  Walk the sorted list grouping any two consecutive    │
+  │  entries within insert_max_spread_sec into the same cluster.        │
+  │  Clusters are candidates for "real gaps RIGHT_UP missed".           │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Step 3c — decide_inserted_gaps                                     │
+  │                                                                     │
+  │  A cluster becomes an inserted gap (GapCorrection) only if ALL of:  │
+  │    • contributing distinct cameras  >=  insert_min_support   (2)    │
+  │    • time spread (max - min center)  <=  insert_max_spread   (1.5s) │
+  │    • mean confidence                  >=  insert_min_conf    (0.4)  │
+  │    • center is at least  insert_min_distance_to_master_sec  (1.0s)  │
+  │      from EVERY existing master gap                                 │
+  │                                                                     │
+  │  Each survivor is recorded as a GapCorrection:                      │
+  │    inserted_at_master_time   = mean of cluster centers              │
+  │    inserted_at_master_frame  = master_fps * mean_time               │
+  │    supporting_cameras        = sorted list                          │
+  │    mean_confidence, time_spread_sec                                 │
+  │    contributing_track_ids    = {cam_id -> support.track_id}         │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Step 3d — synthesize GapEvents for the inserts                     │
+  │                                                                     │
+  │  For each GapCorrection we synthesize a placeholder GapEvent with   │
+  │  negative track_id (so it cannot collide with real master track_ids)│
+  │  positioned at the inserted frame:                                  │
+  │      track_id     = -1, -2, ...                                     │
+  │      camera_id    = 'FUSED(RIGHT_UP_TOP+LEFT_UP_TOP)' etc.          │
+  │      start/end_frame = f-1, f+1                                     │
+  │      class_label  = 'gap_inserted'                                  │
+  │                                                                     │
+  │  Final fused timeline = sorted(real_master_gaps + synth_gaps) by    │
+  │  center_time.                                                       │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  Tuning knobs (CLI flags, defaults in PHASE1_DEFAULTS):
+      --fuse-min-support      default 2       minimum supporting cameras
+      --fuse-max-spread       default 1.5s    cluster + match window
+      --fuse-min-conf         default 0.4     minimum cluster mean conf
+
+
+================================================================================
+  STEP 4 — REBUILD GLOBAL WAGONS   (global_alignment.build_global_wagons)
+================================================================================
+
+  Convert the fused gap timeline to ordered wagon segments.
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Step 4a — boundary frame list                                      │
+  │    boundaries = sorted([round(g.center_frame) for g in fused_gaps]) │
+  │    clipped into [0, master_total_frames - 1]                        │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Step 4b — segments                                                 │
+  │    walk boundaries:                                                 │
+  │      seg_1 = [0, boundary_1 - 1]                                    │
+  │      seg_2 = [boundary_1, boundary_2 - 1]                           │
+  │      ...                                                            │
+  │      seg_N = [boundary_{N-1}, total_frames - 1]                     │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Step 4c — classification inheritance                               │
+  │    For each new segment, look at its center frame and find the      │
+  │    pre-fusion _MasterClassification that contains that frame.       │
+  │    Inherit (label, confidence) from that parent.                    │
+  │                                                                     │
+  │    This is the key invariant that protects ENGINE / BRAKE_VAN:      │
+  │    a newly inserted gap can SPLIT a 'WAGON' parent into two child   │
+  │    'WAGON' segments, but it can never reclassify an ENGINE or       │
+  │    BRAKE_VAN parent into something else.                            │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Step 4d — issue global ids                                         │
+  │    GW_1, GW_2, ..., GW_N                                            │
+  │    record per-wagon:                                                │
+  │      global_id, wagon_index, start_frame_master, end_frame_master   │
+  │      start_time, end_time, classification, classification_conf      │
+  │      supporting_cameras = [MASTER + others]                         │
+  │      split_from_global_id = 'PRE_SEG_{i}' if either bounding gap    │
+  │        was inserted (provenance for audit only)                     │
+  │      leading_gap / trailing_gap = serialized boundary GapEvent or   │
+  │        {'source': 'video_start' | 'video_end'}                      │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  Fallback: if assemble_global_train_state raises OR produces an empty
+  wagon list, build_wagons_pure_master is called instead — same logic
+  but using only RIGHT_UP's gaps with no insertions.  GlobalTrainState
+  records fallback_used = True with a reason string.
+
+
+================================================================================
+  STEP 5 — WRITE  global_train_state.json
+================================================================================
+
+  Canonical Phase-1 output.  Schema tag: "wagon_eye.global_train_state.v1"
+
+      results/global_train_state.json   ← the only file Phase-2 reads
+
+  Shape (abridged):
+
+      {
+        "schema": "wagon_eye.global_train_state.v1",
+        "master_camera": "RIGHT_UP",
+        "master_fps": 25.0,
+        "master_total_frames": 7321,
+        "total_wagons": 47,
+        "regular_wagon_count": 45,
+        "engine_count": 1,
+        "brake_van_count": 1,
+        "wagons": [
+          {
+            "global_id": "GW_1",
+            "wagon_index": 1,
+            "start_frame_master": 0,
+            "end_frame_master": 312,
+            "start_time": 0.0,
+            "end_time": 12.52,
+            "classification": "ENGINE",
+            "classification_confidence": 0.94,
+            "supporting_cameras": ["RIGHT_UP","LEFT_UP","RIGHT_UP_TOP","LEFT_UP_TOP"],
+            "split_from_global_id": null,
+            "leading_gap":  {"source": "video_start"},
+            "trailing_gap": {"source": "master", "camera_id": "RIGHT_UP",
+                             "track_id": 1, "center_time": 12.51}
+          },
+          ...
+        ],
+        "per_camera_local_counts": { "RIGHT_UP": 46, ... },
+        "per_camera_gap_counts":   { "RIGHT_UP": 45, ... },
+        "corrections_applied":     [ { ... GapCorrection ... } ],
+        "fallback_used": false,
+        "notes": []
+      }
+
+  A debug-side dump  results/per_camera_tracking.json  is also written,
+  containing every camera's raw GapEvent list + RIGHT_UP's pre-fusion
+  classifications.
+
+
+================================================================================
+  STEP 6 — OVERLAY VIDEOS   (video_segmenter.render_processed_video)
+================================================================================
+
+  One pass per camera.  For each frame:
+
+      1) MAGENTA top/bottom flash for ±3 frames around any projected
+         wagon-boundary frame  (= the camera's local frame where any
+         GW starts, derived by  round(GW.start_time * cam_fps) ).
+
+      2) YELLOW (0,255,255) tracked-gap bbox:
+         For every confirmed GapEvent whose [start_frame, end_frame]
+         contains the current frame, draw an interpolated bbox using
+         the gap's hit_frames + bbox_history arrays:
+              before first hit     → first bbox
+              after last hit       → last bbox
+              between two hits     → linear component-wise interp
+         Label: "GAP #{track_id}  conf={mean_conf:.2f}"
+
+         This is what guarantees a continuous bbox on every camera —
+         even when YOLO does not fire on a particular frame, the
+         tracker still knows the gap is there.
+
+      3) CYAN (255,255,0) raw YOLO bbox + per-frame confidence,
+         drawn on top of (2) so you can see when YOLO is actively
+         firing vs. when only the tracker is asserting presence.
+
+      4) Top-left info panel:
+           Camera : <id>
+           Frame  : <idx> / <total>
+           Wagon  : GW_n  [CLASSIFICATION]   ← colored by class
+              t = start_s - end_s
+           Gap #n  conf=...                  ← only when in a gap span
+           Train  : N wagons (E:e W:w B:b)
+           FALLBACK MODE                     ← red, only if fused failed
+
+  Output codec: mp4v (broadly compatible without openh264).
+
+  Output:
+      results/processed_videos/RIGHT_UP_processed.mp4
+      results/processed_videos/LEFT_UP_processed.mp4
+      results/processed_videos/RIGHT_UP_TOP_processed.mp4
+      results/processed_videos/LEFT_UP_TOP_processed.mp4
+
+
+================================================================================
+  STEP 7 — PER-WAGON FRAME EXTRACTION   (video_segmenter.extract_wagon_frames)
+================================================================================
+
+  This is the foundation that Phase-2+ feature extractors will consume.
+
+  For each camera:
+
+      1) Build  cam_wagon_ranges = {GW_n: (start_local, end_local)}
+         where local frame range comes from
+            start_local = round(GW.start_time * cam.fps)
+            end_local   = round(GW.end_time   * cam.fps) - 1
+         clipped into [0, cam.total_frames - 1].
+
+      2) Walk the video frame-by-frame.  If frame_idx falls inside
+         exactly one GW's range AND (frame_idx % every_nth_frame == 0)
+         write the frame to:
+            results/frames/<CAMERA>/<GW_n>/frame_<NNNNNN>.jpg
+         at JPEG quality 90.
+
+      3) Print per-wagon counts at end of camera pass.
+
+  Result layout:
+
+      results/frames/
+          RIGHT_UP/
+              GW_1/  frame_000000.jpg, frame_000001.jpg, ...
+              GW_2/  ...
+              ...
+          LEFT_UP/      (same GW_n layout)
+          RIGHT_UP_TOP/ (same GW_n layout)
+          LEFT_UP_TOP/  (same GW_n layout)
+
+  CONSISTENCY GUARANTEE:
+      RIGHT_UP/GW_17  LEFT_UP/GW_17  RIGHT_UP_TOP/GW_17  LEFT_UP_TOP/GW_17
+      all hold frames of the SAME PHYSICAL WAGON.
+      This is the input contract Phase-2 consumes.
+
+  Tuning knobs:
+      --every-nth-frame  default 1  (1 = keep every frame, 5 = sparser)
+      --no-frames        skip this step entirely
+
+
+================================================================================
+  STEP 8 — FINAL CONSOLE SUMMARY
+================================================================================
+
+  Printed via global_train_state.summarize_state(state):
+
+      ======================================================================
+        GLOBAL TRAIN STATE SUMMARY
+      ======================================================================
+        Master camera        : RIGHT_UP
+        Master fps           : 25.000
+        Master total frames  : 7321
+
+        Per-camera local counts (wagons / gaps / status):
+          RIGHT_UP        wagons=46   gaps=45   [ok]
+          LEFT_UP         wagons=45   gaps=44   [ok]
+          RIGHT_UP_TOP    wagons=47   gaps=46   [ok]
+          LEFT_UP_TOP     wagons=47   gaps=46   [ok]
+
+        Corrections applied  : 1
+          + insert @ t=134.40s  frame=3360  supports=LEFT_UP_TOP/RIGHT_UP_TOP
+                                conf=0.78  spread=0.32s
+
+        FINAL FUSED WAGON COUNT : 47
+           regular wagons       : 45
+           engines              : 1
+           brake vans           : 1
+      ======================================================================
+
+  If fallback was used, an extra red banner says:
+
+        ⚠ FALLBACK USED        : <reason>
+
+
+================================================================================
+================================================================================
+                        END-TO-END FLOW DIAGRAM
+================================================================================
+================================================================================
+
+   ┌─────────────────────────────────────────────────────────────────┐
+   │                  run_global_count.py                            │
+   │                                                                 │
+   │   ┌───────────────────────────────────────────────────────┐    │
+   │   │  resolve inputs (./inputs)  +  models (./models)      │    │
+   │   └─────────────┬─────────────────────────────────────────┘    │
+   │                 │                                                │
+   │                 ▼                                                │
+   │   ┌───────────────────────────────────────────────────────┐    │
+   │   │  STEP 1  per-camera tracking (4 sequential)           │    │
+   │   │    RIGHT_UP        → right_up_wagon_gap.pt + Kalman   │    │
+   │   │    LEFT_UP         → left_up_wagon_gap.pt  + Kalman   │    │
+   │   │    RIGHT_UP_TOP    → top_gap.pt            + Kalman   │    │
+   │   │    LEFT_UP_TOP     → top_gap.pt            + Kalman   │    │
+   │   │  emit one LocalCameraTracks per camera                │    │
+   │   └─────────────┬─────────────────────────────────────────┘    │
+   │                 │                                                │
+   │                 ▼                                                │
+   │   ┌───────────────────────────────────────────────────────┐    │
+   │   │  STEP 2  RIGHT_UP master classification               │    │
+   │   │    segments_from_gaps(master.gaps, total_frames)      │    │
+   │   │    side_classification.pt majority vote x5 samples    │    │
+   │   │  emit [_MasterClassification, ...]                    │    │
+   │   └─────────────┬─────────────────────────────────────────┘    │
+   │                 │                                                │
+   │                 ▼                                                │
+   │   ┌───────────────────────────────────────────────────────┐    │
+   │   │  STEP 3  global_alignment.fuse_master_timeline        │    │
+   │   │    match_support_to_master                            │    │
+   │   │    cluster_unmatched_supports                         │    │
+   │   │    decide_inserted_gaps  (2-of-3 quorum)              │    │
+   │   │  emit fused_gaps + [GapCorrection, ...]               │    │
+   │   └─────────────┬─────────────────────────────────────────┘    │
+   │                 │                                                │
+   │                 ▼                                                │
+   │   ┌───────────────────────────────────────────────────────┐    │
+   │   │  STEP 4  build_global_wagons                          │    │
+   │   │    boundaries → segments → GW_1..GW_N                 │    │
+   │   │    classification inheritance from PRE_SEG_i          │    │
+   │   │  emit GlobalTrainState (with fallback path)           │    │
+   │   └─────────────┬─────────────────────────────────────────┘    │
+   │                 │                                                │
+   │                 ▼                                                │
+   │   ┌───────────────────────────────────────────────────────┐    │
+   │   │  STEP 5  dump JSON                                    │    │
+   │   │    results/global_train_state.json                    │    │
+   │   │    results/per_camera_tracking.json                   │    │
+   │   └─────────────┬─────────────────────────────────────────┘    │
+   │                 │                                                │
+   │                 ▼                                                │
+   │   ┌───────────────────────────────────────────────────────┐    │
+   │   │  STEP 6  overlay videos (one per camera)              │    │
+   │   │    YELLOW tracked-gap bbox (interpolated, continuous) │    │
+   │   │    CYAN  raw YOLO bbox (per frame, when present)      │    │
+   │   │    MAGENTA wagon-boundary flash                       │    │
+   │   │  results/processed_videos/{CAMERA}_processed.mp4      │    │
+   │   └─────────────┬─────────────────────────────────────────┘    │
+   │                 │                                                │
+   │                 ▼                                                │
+   │   ┌───────────────────────────────────────────────────────┐    │
+   │   │  STEP 7  per-wagon JPEG extraction (one per camera)   │    │
+   │   │  results/frames/{CAMERA}/{GW_n}/frame_NNNNNN.jpg      │    │
+   │   └─────────────┬─────────────────────────────────────────┘    │
+   │                 │                                                │
+   │                 ▼                                                │
+   │   ┌───────────────────────────────────────────────────────┐    │
+   │   │  STEP 8  summary print                                │    │
+   │   └───────────────────────────────────────────────────────┘    │
+   └─────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+  CONSISTENCY & DETERMINISM GUARANTEES
+================================================================================
+
+  1. Same 4 input videos + same 3 model files + same CLI flags
+     → byte-identical global_train_state.json.
+
+  2. Track ids are reassigned 1..N after tracking, sorted by first_frame
+     then last_seen_frame. No randomness.
+
+  3. Inserted-gap acceptance order is deterministic:
+       sort(clusters, key=cluster.mean_center_time)
+
+  4. Cluster sweep iterates the union of leftover support gaps sorted
+     by  (center_time, camera_id, track_id).
+
+  5. Classification majority vote ties broken by alphabetical priority
+     (the same way wagon_classifier.py has always done it).
+
+  6. Per-camera frame range for any GW_n is purely a function of
+     (GW.start_time, GW.end_time, cam.fps) — same answer every run.
+
+
+================================================================================
+  ERROR / FALLBACK BEHAVIOR
+================================================================================
+
+  ┌────────────────────────────────┬──────────────────────────────────┐
+  │ Condition                      │ Outcome                          │
+  ├────────────────────────────────┼──────────────────────────────────┤
+  │ Missing video / missing model  │ FileNotFoundError, exit 2,       │
+  │                                │ clean "looked here, drop file    │
+  │                                │ there" message.                  │
+  ├────────────────────────────────┼──────────────────────────────────┤
+  │ Corrupt / truncated .pt file   │ ultralytics-thrown RuntimeError; │
+  │                                │ exit 3.  See README diagnostic.  │
+  ├────────────────────────────────┼──────────────────────────────────┤
+  │ Cannot open one of the videos  │ RuntimeError, exit 3.            │
+  ├────────────────────────────────┼──────────────────────────────────┤
+  │ Fusion raises internally       │ Caught;  fallback_used = True;   │
+  │                                │ build_wagons_pure_master is used │
+  │                                │ (RIGHT_UP only, no inserts);     │
+  │                                │ run completes; JSON written;     │
+  │                                │ summary prints with FALLBACK     │
+  │                                │ banner.                          │
+  ├────────────────────────────────┼──────────────────────────────────┤
+  │ Render or extraction fails for │ Caught per-camera;  recorded in  │
+  │ one camera                     │ state.notes ("render_failed:...")│
+  │                                │ remaining cameras still run.     │
+  ├────────────────────────────────┼──────────────────────────────────┤
+  │ Zero wagons emitted            │ fallback path replaces them with │
+  │                                │ pure-master build; if THAT is    │
+  │                                │ also empty, total_wagons = 0     │
+  │                                │ and notes explain.               │
+  └────────────────────────────────┴──────────────────────────────────┘
+
+
+================================================================================
+  CONFIGURATION SUMMARY  (CLI flags + defaults)
+================================================================================
+
+  ┌──────────────────────────────────┬──────────┬───────────────────────┐
+  │ Knob                             │ Default  │ Where                 │
+  ├──────────────────────────────────┼──────────┼───────────────────────┤
+  │ --inputs-dir                     │ ./inputs │ run_global_count.py   │
+  │ --models-dir                     │ ./models │ run_global_count.py   │
+  │ --output / -o                    │ ./results│ run_global_count.py   │
+  ├──────────────────────────────────┼──────────┼───────────────────────┤
+  │ --side-confidence                │ 0.4      │ side gap models thr.  │
+  │ --top-confidence                 │ 0.4      │ top_gap.pt thr.       │
+  │ --classification-samples         │ 5        │ frames/seg in vote    │
+  ├──────────────────────────────────┼──────────┼───────────────────────┤
+  │ --fuse-min-support               │ 2        │ cameras for insert    │
+  │ --fuse-max-spread                │ 1.5s     │ cluster + match win   │
+  │ --fuse-min-conf                  │ 0.4      │ min cluster mean conf │
+  ├──────────────────────────────────┼──────────┼───────────────────────┤
+  │ --every-nth-frame                │ 1        │ frame extraction      │
+  │ --no-videos                      │ off      │ skip step 6           │
+  │ --no-frames                      │ off      │ skip step 7           │
+  │ --no-raw-detections              │ off      │ save RAM, no cyan box │
+  │ --quiet                          │ off      │ less stdout           │
+  └──────────────────────────────────┴──────────┴───────────────────────┘
+
+  In-tracker defaults (not yet exposed as CLI flags — edit
+  tracker_engine.py if you need to override):
+
+      GapTracker.min_height_ratio   = 0.35   bbox height / frame height
+      GapTracker.match_distance_px  = 80.0   greedy NN association
+      GapTracker.min_hits           = 3      confirm a track
+      GapTracker.max_miss           = 30     close a track
+
+
+================================================================================
+  RUN COMMANDS
+================================================================================
+
+  Default run (drop files in inputs/ + models/):
+
+      cd wagon_count
+      python run_global_count.py
+
+  Explicit paths:
+
+      python run_global_count.py \
+        --right_up     /data/right_up.mp4 \
+        --left_up      /data/left_up.mp4 \
+        --right_up_top /data/right_up_top.mp4 \
+        --left_up_top  /data/left_up_top.mp4 \
+        --models-dir   /opt/models \
+        --output       /opt/results
+
+  Optional interactive debugging (NOT the production path):
+
+      jupyter lab RUN_WAGON_COUNT.ipynb     # then Run All
+      # RUN_WAGON_COUNT.ipynb is an optional local-debugging aid that works in
+      # any Jupyter install.  Production EC2 deployment uses the CLI above /
+      # orchestrator.master_runner -- no notebook or Jupyter runtime required.
+
+
+================================================================================
+  PHASE-2 HANDOFF CONTRACT
+================================================================================
+
+  Phase-2 (door state, damage, OCR, loaded/empty, report) MUST consume:
+
+      results/global_train_state.json
+      results/frames/<CAMERA>/<GW_n>/*.jpg
+
+  and MUST NOT re-run wagon counting or classification.  The same GW_n
+  across cameras refers to the same physical wagon by construction —
+  any Phase-2 feature extractor can attach its output to that GW_n
+  directly without further alignment.
+
+
+================================================================================
+                     END OF PHASE-1 WORKFLOW DOCUMENT
+================================================================================

@@ -1,0 +1,1861 @@
+================================================================================
+       WAGON EYE v4 -- COMPLETE END-TO-END WORKFLOW
+       Train-State-Native Pipeline + Full Legacy Feature Intelligence
+================================================================================
+  Package : wagon_eye_v4/
+  Scope   : 4 raw videos -> GlobalTrainState -> wagon cache -> features
+            (+ evidence) -> fusion -> overlay videos -> 4 camera reports
+            -> combined PDF + JSON -> S3 + email
+  NOT     : per-camera local counting, mini-mp4 reconstruction, legacy
+            process_video() wrappers, gap re-detection downstream of Stage 1,
+            detector reruns inside the rendering layer
+
+  Version : v4.4  (v4.3 reporting identity preserved, but the report
+                   ORGANIZATION now matches the legacy camera-wise
+                   hierarchy: Stage 5a emits 4 CAMERA reports
+                   (right_up / left_up / right_up_top / left_up_top),
+                   each scoped to that camera's authority; Stage 5b
+                   aggregates them into the combined train report.
+                   reporting/feature_reports.py was replaced by
+                   reporting/camera_reports.py (+ shared reporting/
+                   _pages.py).  No change to reconstruction, fusion,
+                   wagon counting, feature inference, or the
+                   visualization layer.)
+
+  Update  : v4.5  (docs)  Added the END-TO-END DATA FLOW summary, a full
+                   RUNNING ON EC2 runbook, and an ENVIRONMENT VARIABLES
+                   reference.  Documented delivery/finalization.py
+                   (exactly-once upload+email) and the new, default-OFF
+                   delivery/dashboard_ingest.py legacy-dashboard adapter.
+                   No runtime behaviour changed by these doc updates.
+================================================================================
+
+
+  PURPOSE
+  -------
+  Every component in this pipeline is built around ONE invariant:
+
+      GlobalTrainState is the single source of truth for wagon counting,
+      numbering, boundaries, and ENGINE / WAGON / BRAKE_VAN classification.
+
+  Only Stage 1 (the wagon_count subpackage) is allowed to detect gaps,
+  perform counting, assign wagon ids, or define wagon boundaries.  Every
+  later stage consumes the GlobalTrainState and produces a deterministic
+  artefact derived from it -- never a recount.
+
+  RIGHT_UP is the master camera.  Its gap detections and classifications
+  drive the GlobalTrainState; the other three cameras contribute support
+  evidence only.
+
+  Each feature processor reuses the SAME mature inference intelligence
+  the legacy system spent thousands of lines on -- Kalman + Hungarian
+  tracking, illumination quality scoring, geometric shape priors,
+  state-machine hysteresis with quality-weighted voting, identity
+  merging, OCR preprocessing + digit-level voting, edge-zone damage
+  suppression, loaded-wagon floor-damage filtering, etc.  These live
+  in `features/inference_lib/` and are driven from a pure frame
+  iterator -- never from a `cv2.VideoCapture` loop.
+
+
+================================================================================
+  PACKAGE LAYOUT
+================================================================================
+
+  wagon_eye_v4/
+  |
+  +-- orchestrator/master_runner.py        * entry point
+  |
+  +-- reconstruction/runner.py             Stage 1 driver (subprocess wagon_count)
+  +-- materializer/wagon_cache_builder.py  Stage 2: single-pass frame extraction
+  +-- features/
+  |   +-- _common.py                       YOLO loader cache, frame iterator,
+  |   |                                    deterministic helpers
+  |   +-- _evidence.py                     evidence persistence helpers
+  |   |                                    (BestFrameTracker + wagon_evidence_dir
+  |   |                                     + save_jpeg/safe_crop/draw_annotated_bbox)
+  |   +-- inference_lib/                   * MATURE LEGACY INTELLIGENCE *
+  |   |   +-- door_tracker.py              Kalman + Hungarian + FSM + voting
+  |   |   +-- door_identity_merger.py      cross-frame door identity merge
+  |   |   +-- illumination_processor.py    quality scoring + CLAHE + gamma
+  |   |   +-- geometric_shape_prior.py     aspect / vertical-edge / border
+  |   |   +-- snapshot_selector.py         multi-metric best-frame scoring
+  |   |   +-- wagon_number_ocr.py          6-step OCR preprocessing + easyocr
+  |   |   +-- wagon_number_aggregator.py   exact-string + digit-level voting
+  |   |   +-- damage_tracker.py            damage Kalman + Hungarian + voting
+  |   +-- door/processor.py                drives the door intelligence chain
+  |   +-- ocr/processor.py                 drives the OCR intelligence chain
+  |   +-- load/processor.py                >35% LOADED voting + class gates
+  |   +-- damage/processor.py              drives damage intel + edge filter +
+  |                                        loaded-wagon floor-damage skip
+  +-- fusion/wagon_state_builder.py        Stage 4: authority-rule fusion
+  +-- rendering/
+  |   +-- feature_overlay_renderer.py      Stage 4b: visualization-only renderer.
+  |                                        Consumes GlobalTrainState +
+  |                                        UnifiedWagonState + evidence metadata
+  |                                        + per_camera_tracking.json.
+  |                                        NEVER invokes any detector model.
+  +-- reporting/
+  |   +-- _brand.py                        Legacy WagonEye palette (NAVY_DARK,
+  |   |                                    TEAL_ACCENT, ISSUE_BG, ...), paragraph
+  |   |                                    styles, anomaly + state helpers
+  |   |                                    (format_door_status, is_side_anomaly,
+  |   |                                    is_top_anomaly), page widgets
+  |   |                                    (logo callback, warning banner,
+  |   |                                    camera link).
+  |   +-- _adapter.py                      v4 backend -> legacy report view-
+  |   |                                    model (merged_wagons dicts + per-
+  |   |                                    camera door/damage entries +
+  |   |                                    state_counts + 10-col KPI summary).
+  |   |                                    Reads GlobalTrainState +
+  |   |                                    UnifiedWagonState + evidence/ +
+  |   |                                    wagon_states/.  No model loads.
+  |   +-- _evidence_lookup.py              Quartile (12.5/37.5/62.5/87.5%) +
+  |   |                                    midpoint cache-frame resolution
+  |   |                                    + evidence snapshot + per-wagon
+  |   |                                    JSON read helpers.
+  |   +-- _pages.py                        Shared reportlab page widgets
+  |   |                                    (doc maker, bordered image,
+  |   |                                    detection-summary table, wagon
+  |   |                                    quartile overview, generic
+  |   |                                    state-tinted detail page,
+  |   |                                    simple-state page).
+  |   +-- camera_reports.py                Stage 5a: 4 CAMERA-WISE PDFs.
+  |   |                                    One per camera, scoped to that
+  |   |                                    camera's authority:
+  |   |                                      right_up_report.pdf     -> right
+  |   |                                        door, OCR, classification
+  |   |                                      left_up_report.pdf      -> left door
+  |   |                                      right_up_top_report.pdf -> load,
+  |   |                                        top damage
+  |   |                                      left_up_top_report.pdf  -> top-
+  |   |                                        damage support / validation
+  |   |                                    Each: Camera Summary page (visible
+  |   |                                    wagons, anomalies, processing
+  |   |                                    confidence, coverage %), per-wagon
+  |   |                                    pages (quartile overview + detail
+  |   |                                    pages, snapshots from THAT camera
+  |   |                                    only), Anomaly Summary by severity,
+  |   |                                    Camera Evidence section.
+  |   +-- combined_train_report.py         Stage 5b: combined PDF + JSON.
+  |   |                                    Aggregates the 4 camera reports.
+  |   |                                    Legacy WagonEye identity (navy
+  |   |                                    title banner, VIDEO EVIDENCE
+  |   |                                    table, PARTIAL REPORT banner,
+  |   |                                    DETAILED CAMERA REPORTS table
+  |   |                                    (LEFT/RIGHT/R-TOP/L-TOP links),
+  |   |                                    10-col INSPECTION SUMMARY,
+  |   |                                    7-col wagon inspection table
+  |   |                                    with issue-row highlighting,
+  |   |                                    Damaged Wagon Report evidence
+  |   |                                    grid sorted by wagon# + camera
+  |   |                                    priority).  Schema v4.
+  |   +-- assets/Logo.jpeg                 Per-page logo (copied once from
+  |                                        old_system/RIGHT_UP/Logo.jpeg).
+  +-- delivery/
+  |   +-- s3_upload.py                     Stage 6 archive (PDF, JSON, tree)
+  |   +-- notification.py                  Stage 6 email (one per batch)
+  |   +-- finalization.py                  Stage 6 idempotency marker
+  |   |                                    (exactly-once upload + email)
+  |   +-- dashboard_ingest.py              Stage 6 OPTIONAL legacy-dashboard
+  |                                        adapter (default OFF, read-only)
+  +-- core/
+  |   +-- constants.py                     camera ids, S3, status sentinels
+  |   +-- unified_wagon_state.py           UnifiedWagonState dataclass
+  |   +-- global_state_loader.py           GlobalTrainState dataclass + loader
+  |   +-- batch.py                         CameraVideo / TrainBatch
+  +-- models/
+  |   +-- reconstruction/                  drop Stage-1 .pt files here
+  |   +-- features/                        drop Stage-3 .pt files here
+  +-- wagon_count/                         Phase-1 subpackage + short-name shim
+  |
+  +-- README.md
+  +-- requirements.txt
+
+
+  Output per batch (under <workspace>/<batch_key>/):
+
+      downloads/                  raw videos
+      global_state/
+          global_train_state.json
+          per_camera_tracking.json
+          processed_videos/                  wagon_count's debug tracking
+              RIGHT_UP_processed.mp4         overlays (re-enabled in v4.2;
+              LEFT_UP_processed.mp4          gap boxes + wagon-boundary
+              RIGHT_UP_TOP_processed.mp4     flashes only -- no feature
+              LEFT_UP_TOP_processed.mp4      annotations).
+      wagon_cache/
+          GW_1/
+              right_up/      frame_000037.jpg ...
+              left_up/       ...
+              right_up_top/  ...
+              left_up_top/   ...
+          GW_2/...
+          ...
+      wagon_states/
+          door/    GW_*.json
+          load/    GW_*.json
+          damage/  GW_*.json
+          ocr/     GW_*.json
+          unified/ GW_*.json     <- UnifiedWagonState (one per GW)
+      evidence/                                 per-wagon best-frame snapshots
+          GW_1/
+              door/   left_best.jpg, left_crop.jpg,
+                      right_best.jpg, right_crop.jpg, metadata.json
+              damage/ track_1.jpg, track_1_crop.jpg, ..., metadata.json
+              ocr/    best_frame.jpg, number_crop.jpg, metadata.json
+              load/   best_frame.jpg, metadata.json
+          GW_2/...
+      processed_videos/                          rich feature-overlay videos
+          RIGHT_UP_processed.mp4                 (Stage 4b: per-camera overlay
+          LEFT_UP_processed.mp4                  with wagon ids, gap banners,
+          RIGHT_UP_TOP_processed.mp4             feature bboxes on best-frames,
+          LEFT_UP_TOP_processed.mp4              anomaly banners.)
+      reports/
+          right_up_report.pdf                    Stage 5a: CAMERA-WISE
+          left_up_report.pdf                     reports.  One per camera,
+          right_up_top_report.pdf                each scoped to that
+          left_up_top_report.pdf                 camera's authority
+                                                 (right door+OCR+class /
+                                                  left door / load+top
+                                                  damage / top-damage
+                                                  support).  Camera Summary
+                                                  page + per-wagon pages +
+                                                  Anomaly Summary by
+                                                  severity + Camera
+                                                  Evidence section.
+          combined_train_report.json             schema v4 (adds
+                                                  legacy_view_model +
+                                                  evidence_pages)
+          combined_train_report.pdf              Stage 5b: aggregates the
+                                                  4 camera reports.  Legacy
+                                                  WagonEye identity: title
+                                                  banner + DETAILED CAMERA
+                                                  REPORTS links + KPIs +
+                                                  7-col wagon table +
+                                                  Damaged Wagon Report
+                                                  evidence grid.
+
+
+================================================================================
+  ARCHITECTURE INVARIANTS
+================================================================================
+
+  +----------------------------------------------------------------------+
+  | 1. GlobalTrainState is IMMUTABLE downstream of Stage 1.              |
+  | 2. Frames are extracted EXACTLY ONCE FOR INFERENCE (Stage 2).  No    |
+  |    detector / YOLO / OCR / tracking call exists outside Stage 1      |
+  |    (subprocess) and Stage 3.  Stage 4b's overlay renderer DOES open  |
+  |    the raw videos with cv2.VideoCapture, but strictly for            |
+  |    visualization: it never invokes any model -- every overlay is     |
+  |    drawn from already-persisted GlobalTrainState, UnifiedWagonState, |
+  |    evidence metadata, and per_camera_tracking.json.                  |
+  | 3. Each feature processor is driven from a pure frame iterator over  |
+  |    the cached JPEGs.  No process_video() wrappers.                   |
+  | 4. The frame loop hands every detection through the SAME mature      |
+  |    legacy intelligence (Kalman tracking, identity merging, quality   |
+  |    scoring, FSM voting, etc.) that the old camera-centric code used. |
+  |    No simplification, no shortcuts -- the inference quality matches  |
+  |    the legacy system.                                                |
+  | 5. Models live in ONE centralized tree.  No per-camera duplication.  |
+  | 6. Legacy camera folders (RIGHT_UP/, LEFT_UP/, RIGHT_UP_TOP/,        |
+  |    LEFT_UP_TOP/) and the legacy process_video / DoorProcessor /     |
+  |    DamageProcessor wrappers do NOT exist inside this package.        |
+  | 7. Stage failures are LOCAL:  per-wagon failure -> NO_DATA cell.     |
+  |    Only Stage 1 failure aborts the batch.  Stage 4b (rendering) and  |
+  |    Stage 5a (camera reports) failures are per-artifact: a            |
+  |    failed camera mp4 or camera PDF does not block the rest.          |
+  +----------------------------------------------------------------------+
+
+
+================================================================================
+================================================================================
+                          STAGE-BY-STAGE WORKFLOW
+================================================================================
+================================================================================
+
+
+================================================================================
+  STAGE 0  (orchestrator) -- batch acquisition
+================================================================================
+
+  orchestrator/master_runner.py acquires one TrainBatch.  Two modes:
+
+  AUTO    Poll all 4 S3 input prefixes, cluster videos by filename
+          timestamp into batches, pick the oldest complete (or aged
+          partial) batch (delegates to train_batch_manager).
+
+  LOCAL   Scan a local folder for one .mp4 per camera (filenames must
+          contain "right_up" / "left_up" / "right_up_top" / "left_up_top").
+
+  All 4 videos downloaded (or pass-through for local) to
+  <workspace>/<batch_key>/downloads/.
+
+  If fewer than 4 cameras are present, Stage 1 is skipped and the
+  batch is marked failed_no_global_state immediately.
+
+
+================================================================================
+  STAGE 1  reconstruction/runner.py -- global train reconstruction
+================================================================================
+
+  Subprocess wrapper around wagon_count/run_global_count.py with flags:
+      --no-frames   (materializer owns frame extraction)
+
+  Note: --no-videos is intentionally NOT passed since v4.2 so that
+  wagon_count emits its per-camera tracking overlay mp4s as
+  debug artifacts (gap boxes + wagon-boundary flashes only, no feature
+  annotations).  These are SEPARATE from the rich Stage-4b overlays:
+
+      global_state/processed_videos/<CAM>_processed.mp4
+          wagon_count debug overlays (Stage 1 artifact)
+      processed_videos/<CAM>_processed.mp4
+          rich feature overlays (Stage 4b artifact -- this is what the
+          combined report's "PROCESSED VIDEO" URLs point to)
+
+  wagon_count internally runs:
+      per-camera gap tracking (Kalman + persistence)
+      RIGHT_UP master ENGINE / WAGON / BRAKE_VAN classification
+      cross-camera gap fusion (recover gaps RIGHT_UP missed if >=2
+                               support cameras agree)
+      GlobalTrainState assembly with deterministic GW_n ids
+
+  Model resolution accepts both the legacy long names
+  (right_up_wagon_gap.pt / left_up_wagon_gap.pt) AND the new short
+  names (right_up_gap.pt / left_up_gap.pt) -- transparent fallback
+  inside wagon_count._resolve_model().
+
+  Output consumed:
+      global_state/global_train_state.json    -> GlobalTrainState
+      global_state/per_camera_tracking.json   -> {camera_id -> fps,
+                                                  gaps, dimensions}
+
+  Failure policy:
+      subprocess exit != 0     -> ReconstructionError -> batch aborted
+      JSON file missing        -> ReconstructionError -> batch aborted
+      total_wagons == 0        -> ReconstructionError -> batch aborted
+      Batch final_status: failed_no_global_state.  No PDF, no email.
+
+
+================================================================================
+  STAGE 2  materializer/wagon_cache_builder.py
+================================================================================
+
+  Single-pass per-video frame extraction into the shared cache.
+
+  For each camera (parallel via ThreadPoolExecutor(4)):
+      1. Open the source video ONCE via cv2.VideoCapture.
+      2. Pre-compute each GW_n's camera-local frame window:
+                local_start = round(gw.start_time * local_fps)
+                local_end   = round(gw.end_time   * local_fps) - 1
+         clipped into [0, total_frames - 1].
+      3. Walk frames sequentially; write each frame's JPEG to
+                wagon_cache/<GW_n>/<camera_folder>/frame_<NNNNNN>.jpg
+         (camera_folder is lowercase: right_up, left_up, right_up_top,
+         left_up_top).
+
+  This is the LAST place in the pipeline that decodes video.  Every
+  later stage reads JPEGs from disk only.
+
+  Failure policy:
+      One camera's video missing / unreadable -> empty subtree for that
+                                                  camera; other cameras
+                                                  still populated.  Batch
+                                                  continues as
+                                                  completed_partial.
+      Materializer throws (unexpected)        -> failed.  Abandoned.
+
+
+================================================================================
+================================================================================
+  STAGE 3  feature inference -- features/{door,ocr,load,damage}/processor.py
+================================================================================
+================================================================================
+
+  Parallel execution across the 4 features via
+  ThreadPoolExecutor(max_workers=4).  Wagons within a feature are
+  iterated SERIALLY so each YOLO model and each easyocr Reader is
+  loaded ONCE per process and reused across every wagon.
+
+  Each processor is a thin driver that wraps the cached-frame loop
+  around the MATURE LEGACY INTELLIGENCE living in
+  features/inference_lib/.  No detector code is re-implemented; the
+  legacy classes are simply called from a frame iterator instead of a
+  cv2.VideoCapture loop.
+
+
+================================================================================
+  3.A  DOOR  features/door/processor.py
+================================================================================
+
+  Per wagon, for each side camera (RIGHT_UP, LEFT_UP), runs the full
+  legacy door-intelligence chain:
+
+  +----------+ frame +----------------+ +-------------+ +------------+
+  |          | ----> | IlluminationPr | | YOLO        | | Geometric  |
+  | iter     |       |  ocessor       | | door_state  | | ShapePrior |
+  | cached   |  +--> | .process_frame |->| .pt (det)  |->| .filter    |
+  | frames   |  |    | quality_score  | | half=True   | | _detections|
+  +----------+  |    +----------------+ +-------------+ +------------+
+                |                                              |
+                |                                              v
+                |                                       +------------+
+                |                                       | DoorTracker|
+                |                                       | .update    |
+                |                                       | (Kalman +  |
+                |                                       | Hungarian +|
+                |                                       | TrackMemory|
+                |                                       | + FSM)     |
+                +<--------------------------------------+------------+
+                                                               |
+                                                  after-loop   v
+                                                       +----------------+
+                                                       | get_final_door |
+                                                       | _states +      |
+                                                       | IdentityMerger |
+                                                       +----------------+
+                                                               |
+                                                               v
+                                                  _pick_side_state()
+                                                  (DAMAGED > OPEN >
+                                                   PARTIAL > CLOSED)
+
+  Detailed per-frame work:
+
+      1) IlluminationProcessor.process_frame(frame)
+         Quality score in [0, 1] from:
+            brightness    weight 0.20  (optimal ~128, penalize >=200)
+            glare         weight 0.35  (saturated >=250 pixels)
+            shadow        weight 0.35  (dark <=30 pixels)
+            uniformity    weight 0.10  (texture std-dev)
+         Note: legacy explicitly skips photometric correction BEFORE
+               YOLO inference (`door_processor.py:1076-1080`).  Quality
+               score is used ONLY to weight the tracker's voting.
+
+      2) YOLO door_state.pt(frame, verbose=False, half=True)
+         Returns boxes + class names from:
+            open / open_door     -> OPEN
+            closed / closed_door -> CLOSED
+            partial_closed / closed_with_wire -> PARTIAL
+            damage               -> DAMAGE
+         Confidence floor applied EARLY in the processor:
+            conf >= closed_confidence_threshold (default 0.69)
+         Higher per-class thresholds enforced INSIDE the tracker:
+            OPEN requires conf >= open_confidence_threshold (default 0.77)
+
+      3) GeometricShapePrior.filter_detections(frame, boxes, confs, cls)
+         Three checks (all relaxed defaults; non-blocking gates):
+            * aspect ratio in [0.15, 2.0], preferred ~0.50
+            * vertical-edge dominance Sobel_x / Sobel_y >= 0.80
+            * border-completeness via Canny >= 0.01 edge density
+
+      4) yolo_to_detections(...) wraps survivors in Detection objects
+         and tags each with `illumination_quality` so the tracker can
+         quality-weight votes.
+
+      5) DoorTracker.update(detections, frame, frame_w, frame_h):
+            a) Kalman predict for all active tracks (constant-velocity,
+               adaptive process noise: stopped=0.01 / moving=0.5)
+            b) Hungarian association with multi-term cost:
+                  cost = 0.5 * normalized_distance
+                       + 0.5 * (1 - IoU)
+                       + 0.2 * (1 - HSV-histogram-similarity)
+               max_center_distance = 150 px (gate)
+               min_iou_threshold   = 0.10  (gate)
+               direction gate rejects backward matches (>10 px wrong way)
+            c) For matched tracks:
+                  - Kalman update
+                  - TrackMemory.add_prediction with quality-weighted entry
+                  - StateMachine.update with streak counters
+                  - Snapshot scoring (defer; see step 7)
+            d) For unmatched tracks: mark_lost; check exit gate.
+            e) For unmatched detections: try revive a deleted track
+               (spatial overlap + context similarity); else open a new
+               tentative track.
+               n_init = 2 hits to confirm; max_age = 30 frames.
+
+      6) Per-track StateMachine in door_tracker.py (lines 338-510):
+            UNKNOWN -> OPEN              needs open_streak >= 5
+            UNKNOWN -> PARTIAL_CLOSED    needs partial_closed_streak >= 4
+            UNKNOWN -> CLOSED            needs closed_streak >= 4
+            CLOSED  -> OPEN              needs open_streak >= 5
+            OPEN    -> CLOSED            needs closed_streak >= 8 *
+            OPEN    -> PARTIAL_CLOSED    needs partial_closed_streak >= 8 *
+            DAMAGE  is TERMINAL          (resets all other streaks)
+              (*) 2x hysteresis -- legacy bias against false-closes
+                  on safety-critical OPEN doors.
+
+      7) Snapshot scoring (deferred until end of loop):
+            score = 2.0 * bbox_area_ratio
+                  + 2.5 * (1 - horizontal_distance_from_center)
+                  + 1.0 * detection_confidence
+                  + 0.5 * quality_score
+                  * 0.30 if bbox center within 8% of frame edge
+
+      8) Per-track final decision (door_tracker.py:835-909):
+            * Get majority class + weighted confidence from TrackMemory.
+            * If hits < min_hits_for_decision (2), use majority directly.
+            * Otherwise feed majority + weighted confidence into FSM.
+            * If FSM says OPEN but weighted_conf < 0.77, DOWNGRADE to
+              PARTIAL_CLOSED for safety-conservative reporting.
+              (door_tracker.py:886-887)
+
+  After the frame loop:
+
+      9) DoorIdentityMerger.merge_all_tracks(all_tracks_objs)
+         Post-tracking pass that collapses fragmented tracks of the
+         SAME physical door using four similarity measures (weights
+         from MergeConfig):
+            spatial    0.40  (normalized center distance; hard gate 0.50)
+            temporal   0.15  (overlap + adjacency within 30 frames)
+            context    0.25  (HSV histogram correlation)
+            structural 0.20  (128x128 grayscale cross-correlation)
+         Merge if combined >= 0.85 (conservative).
+
+  Per-camera/side picker (`_pick_side_state` in the processor):
+
+      Priority:  DAMAGED  >  OPEN  >  PARTIAL  >  CLOSED  >  NO_DATA
+      Tiebreak inside a class:  (total_hits, confidence).
+
+      RIGHT_UP -> right_door
+      LEFT_UP  -> left_door
+
+  Output JSON shape (one per wagon):
+
+      {
+          "global_id": "GW_7",
+          "feature":   "door",
+          "status":    "OK" | "NO_FRAMES" | "FAILED" | "NO_DATA",
+          "left_door":              "CLOSED | OPEN | PARTIAL | DAMAGED",
+          "left_door_confidence":   0.91,
+          "right_door":             "...",
+          "right_door_confidence":  0.83,
+          "tracks": [
+              {camera_id, track_id, state, confidence, first_frame,
+               last_frame, total_hits, mean_center_x},
+              ...
+          ],
+          "supporting_cameras": ["LEFT_UP", "RIGHT_UP"],
+          "frame_count": ...,
+      }
+
+  Failure policy:
+      door_state.pt missing             -> NO_DATA for every wagon.
+      Per-wagon exception (e.g. corrupt JPEG inside one wagon folder)
+                                        -> {"status": "FAILED", ...} for
+                                           that wagon; rest continues.
+
+
+================================================================================
+  3.B  OCR  features/ocr/processor.py
+================================================================================
+
+  Per wagon, runs the full legacy OCR intelligence chain on RIGHT_UP
+  frames ONLY (RIGHT_UP is the master / OCR authority).  ENGINE and
+  BRAKE_VAN wagons are short-circuited (no payload OCR).
+
+  +----------+ frame +-------------+ +-----------------+ +-------------+
+  |          | ----> | YOLO        | | WagonNumberOCR  | | WagonNumber |
+  | iter     |       | wagon_id_   | | .reconstruct_   | | Aggregator  |
+  | cached   |       | counting.pt | | wagon_number    |->| .add_wagon  |
+  | RIGHT_UP |       | det boxes   |->| (full 6-step    | | _number     |
+  | frames   |       +-------------+ |  preprocessing  | +-------------+
+  +----------+                       |  + easyocr +    |        |
+                                     |  validation +   |        v
+                                     |  reconstruction)|+--------------+
+                                     +-----------------+| get_aggregat |
+                                                        | ed_numbers   |
+                                                        +--------------+
+                                                                |
+                                                                v
+                                                   pick (is_full_length,
+                                                          observations,
+                                                          mean_conf)
+
+  Per-frame YOLO + per-crop OCR pipeline:
+
+      1) YOLO wagon_id_counting.pt(frame, verbose=False, half=True)
+         Every detected bbox above det_confidence (default 0.40) is a
+         candidate wagon-number region.  No NMS or spatial dedup at
+         frame level -- all crops are independently OCR'd.
+
+      2) For each surviving bbox:
+            crop = features._common.crop_bbox(frame, bbox, pad=10)
+            wagon_num = WagonNumberOCR.reconstruct_wagon_number(
+                crop, yolo_conf, debug=False
+            )
+
+      3) Inside reconstruct_wagon_number, the legacy 6-step ROI crop
+         preprocessing runs first:
+            i)   pad with 10 pixels (already done in step 2)
+            ii)  3x cubic upscale  (cv2.INTER_CUBIC)
+            iii) NLMeans denoise  (h=8, hColor=8,
+                                   template=7x7, search=21x21)
+            iv)  CLAHE on the LAB L-channel (clipLimit=3.5,
+                                              tileGridSize=8x8)
+            v)   unsharp masking  (1.5x weight, sigma=3 blur)
+            vi)  RGB conversion   (easyocr expects RGB)
+
+      4) easyocr.Reader.readtext(image,
+                                 allowlist='0123456789',
+                                 paragraph=False,
+                                 detail=1)
+         Digit-only mode; per-character confidence returned.
+
+      5) Multi-line reconstruction (wagon_number_ocr.py:275-283):
+         Sort recognized texts top-to-bottom by Y coordinate and
+         concatenate digits; pick the rightmost 11-digit window if the
+         concatenated string is longer.
+
+      6) Wagon-type confusion-map correction
+         (wagon_number_ocr.py:319-368):
+         If the first 2 digits fall outside the valid Indian Railways
+         wagon-type range [10, 39], apply the OCR confusion map:
+            '0' -> '2'   '4' -> '1'   '5' -> '3'
+            '6' -> '1'   '7' -> '1'   '8' -> '3'   '9' -> '3'
+         Returns a `was_manipulated` flag for audit.
+
+      7) WagonNumberValidator.validate(digits, ...):
+            * len(digits) == 11                         hard
+            * digits.isdigit()                          hard
+            * first two digits in [10, 39]              hard
+            * year code (digits[4:6]) in 1950-2049      warn-only
+
+      8) Build a WagonNumber dataclass with:
+            full_number, wagon_type, owning_railway, year_of_manufacture,
+            individual_number, check_digit, yolo_confidence, ocr_confidence
+
+      9) WagonNumberAggregator.add_wagon_number(wagon_num, frame_idx):
+         Stores per-string buckets with running statistics.
+
+  After the frame loop:
+
+      10) WagonNumberAggregator.get_aggregated_numbers() returns
+          AggregatedWagonNumber records, each carrying:
+             * exact-string grouping
+             * digit-level voting per position when multiple results
+               disagree by 1-2 digits (Counter.most_common per index)
+             * frame_count >= min_frame_count (2)
+             * avg_confidence >= min_confidence (0.30)
+             * `require_validation = True` keeps only validated entries
+
+      11) Processor picks the winner with sort key
+              (is_full_length, observations, mean_conf, full_number)
+          and reports it as the wagon_identifier.  Aggregator output
+          plus the first 8 raw frame candidates are kept in the JSON
+          for audit.
+
+  Output JSON shape (one per wagon):
+
+      {
+          "global_id":  "GW_7",
+          "feature":    "ocr",
+          "status":     "OK" | "NO_FRAMES" | "FAILED" | "NO_DATA",
+          "wagon_identifier":              "32145678901",
+          "wagon_identifier_confidence":   0.83,
+          "candidates":  [
+              {full_number, observations, mean_conf, yolo_conf,
+               is_full_length},
+              ...
+          ],
+          "raw_candidates_first_8": [...],
+          "supporting_cameras": ["RIGHT_UP"],
+          "frame_count": ...,
+      }
+
+  Failure policy:
+      wagon_id_counting.pt missing OR easyocr unavailable
+                                  -> NO_DATA for every wagon.
+      ENGINE / BRAKE_VAN          -> OK with wagon_identifier=NO_DATA
+                                      and skipped_reason=classification.
+      Per-wagon exception         -> FAILED for that wagon.
+
+
+================================================================================
+  3.C  LOAD  features/load/processor.py
+================================================================================
+
+  Per wagon, runs the legacy loaded/empty voting on top cameras
+  (RIGHT_UP_TOP authoritative, LEFT_UP_TOP supporting).  ENGINE and
+  BRAKE_VAN wagons are short-circuited (no payload to classify).
+
+  Per-frame work:
+
+      1) YOLO loaded.pt(frame).  This model emits CLASSIFICATION
+         output (`results.probs.top1` + `top1conf`).  features._common.
+         run_classification handles the box-fallback gracefully if a
+         detection-style variant is loaded instead.
+
+      2) Canonicalize the top-1 class name:
+            loaded / load / full   -> LOAD_LOADED
+            empty / unload         -> LOAD_EMPTY
+            other                  -> not counted
+
+      3) For each camera, accumulate per-class confidence lists:
+            loaded_confs : List[float]
+            empty_confs  : List[float]
+         (Frames that don't map into either bucket are counted in `used`
+          but contribute no vote -- mirrors legacy behaviour.)
+
+  After the frame loop, the LEGACY VOTING RULE
+  (RIGHT_UP_TOP/damage_processor.py:1047) is applied per camera:
+
+      loaded_ratio = n_loaded / n_frames_used
+      if loaded_ratio > 0.35 and n_loaded > 0:
+          camera_status = LOADED ; conf = mean(loaded_confs)
+      elif n_empty > 0:
+          camera_status = EMPTY  ; conf = mean(empty_confs)
+      else:
+          camera_status = NO_DATA
+
+  Cross-camera fusion (matches the Stage-4 authority rule):
+
+      if right_up_top.status != NO_DATA:
+          fused = right_up_top
+      elif left_up_top.status != NO_DATA:
+          fused = left_up_top
+      else:
+          fused = NO_DATA
+
+  Output JSON shape (one per wagon):
+
+      {
+          "global_id":   "GW_7",
+          "feature":     "load",
+          "status":      "OK" | "NO_FRAMES" | "FAILED" | "NO_DATA",
+          "load_status": "LOADED" | "EMPTY" | "NO_DATA",
+          "load_confidence": 0.85,
+          "per_camera": {
+              "RIGHT_UP_TOP": {load_status, confidence, loaded_count,
+                               empty_count, frames_used, loaded_ratio},
+              "LEFT_UP_TOP":  {...},
+          },
+          "supporting_cameras": [...],
+          "frame_count": ...,
+      }
+
+  Failure policy:
+      loaded.pt missing       -> NO_DATA for every wagon.
+      ENGINE / BRAKE_VAN      -> OK with load_status=NO_DATA and
+                                  skipped_reason=classification.
+      Per-wagon exception     -> FAILED for that wagon.
+
+
+================================================================================
+  3.D  DAMAGE  features/damage/processor.py
+================================================================================
+
+  Per wagon, runs the full legacy damage intelligence on top cameras
+  (RIGHT_UP_TOP + LEFT_UP_TOP).  ENGINE and BRAKE_VAN wagons are
+  short-circuited.
+
+  +----------+ frame +-------------+ +------------+ +------------+
+  |          | ----> | YOLO        | | filter_dets| | Damage     |
+  | iter     |       | damage.pt   | | (conf >=   | | Tracker    |
+  | cached   |       | det boxes   |->| 0.55       |->| .update    |
+  | TOP      |       +-------------+ |  area 0.5- | | (Kalman +  |
+  | frames   |                       |   40%      | | Hungarian +|
+  +----------+                       |  skip-class| | voting +   |
+                                     |   list +   | | snapshot)  |
+                                     |  edge-zone)| +------------+
+                                     +------------+        |
+                                                           v
+                                            +----------------------+
+                                            | get_final_damage     |
+                                            | _states +            |
+                                            | cross-track dedup +  |
+                                            | loaded-wagon floor   |
+                                            | filter +             |
+                                            | any-camera-wins      |
+                                            +----------------------+
+
+  Per-frame filtering (_filter_detections_for_top in processor.py):
+
+      For each YOLO detection:
+          1. SKIP if class_name in {'no_damage', 'wagon', 'engine',
+                                    'tail', 'brake_van', 'guard_van',
+                                    'background', 'outer_wall_damage'}
+             (outer_wall is a side-camera concern; ignored on TOP.)
+          2. SKIP if conf < 0.55
+          3. SKIP if bbox_area / frame_area outside [0.005, 0.40]
+                (tiny-noise floor, huge-FP ceiling)
+          4. EDGE-ZONE suppression with bypass:
+                cx_ratio = cx / frame_w
+                cy_ratio = cy / frame_h
+                at_edge =
+                  (cx_ratio < 0.12 OR cx_ratio > 0.88)
+                  OR
+                  (cy_ratio < 0.10 OR cy_ratio > 0.85)
+                IF at_edge AND conf < 0.70:  SKIP   (likely coupling
+                                                     / transition zone
+                                                     artefact)
+
+  Survivors are wrapped via `yolo_to_damage_detections(...)` and fed
+  into the legacy DamageTracker:
+
+      5) DamageTracker.update(detections, frame, frame_w, frame_h):
+            * Kalman predict (6D state, adaptive Q like the door tracker)
+            * Hungarian association with PURE distance cost:
+                  dist_cost = min(dist / 200.0, 1.0)
+                  iou_weight    = 0.0   (disabled for moving train)
+                  distance_weight = 1.0
+                  hard gate at dist > 200 px (cost = 1e5)
+            * For matched tracks: predict + update + TrackMemory
+              (confidence-weighted majority vote).
+            * Best-snapshot selection per track favours non-gap frames
+              (`is_gap_frame` flag); backup snapshot stored as fallback.
+            * Track lifecycle: n_init=2, max_age=30,
+              min_hits_for_decision=2.
+
+  After the frame loop, per camera:
+
+      6) DamageTracker.get_final_damage_states() returns
+         {track_id -> {class_name, confidence, best_confidence,
+                       total_hits, first_frame, last_frame,
+                       best_snapshot, best_snapshot_bbox,
+                       best_frame_idx}}.
+
+         If best_snapshot came from a gap frame, the tracker auto-swaps
+         it with the backup snapshot.
+
+      7) Cross-track dedup within ONE camera (_dedup_cross_tracks):
+            Sort tracks by (-conf, -hits).
+            For each track, drop if there is already a survivor with:
+                same class_name AND
+                (center distance < 100 px  OR  bbox IoU >= 0.20)
+            Survivor wins.
+
+  Cross-camera + cross-feature fusion (processor.run):
+
+      8) any_damage = True if either RIGHT_UP_TOP or LEFT_UP_TOP
+                       reports >=1 confirmed track.
+
+      9) LOADED-WAGON FLOOR-DAMAGE FILTER (legacy heuristic, exact):
+            If our companion `wagon_states/load/<GW_n>.json` exists and
+            reports load_status == LOADED, drop every track whose
+            class_name == "floor_damage" (the floor is hidden under
+            the cargo; such detections are reflections / cargo edges).
+            Re-evaluate any_damage after the filter.
+
+     10) Per-wagon top_damage verdict:
+            DAMAGE  if any_damage after the loaded-wagon filter
+            OK      if frames seen but no surviving track
+            NO_DATA if no frames at all
+
+  Output JSON shape (one per wagon):
+
+      {
+          "global_id":   "GW_7",
+          "feature":     "damage",
+          "status":      "OK" | "NO_FRAMES" | "FAILED" | "NO_DATA",
+          "top_damage":  "DAMAGE" | "OK" | "NO_DATA",
+          "top_damage_details": [
+              {camera_id, track_id, class_name, confidence,
+               best_confidence, total_hits, first_frame, last_frame,
+               best_frame_idx, bbox},
+              ...
+          ],
+          "per_camera":  {
+              RIGHT_UP_TOP: {damage_status, frames_used, track_count,
+                              tracks},
+              LEFT_UP_TOP:  {...},
+          },
+          "supporting_cameras": [...],
+          "frame_count": ...,
+      }
+
+  Failure policy:
+      damage.pt missing       -> NO_DATA for every wagon.
+      ENGINE / BRAKE_VAN      -> OK with top_damage=NO_DATA + skipped_reason.
+      Per-wagon exception     -> FAILED for that wagon.
+
+  Execution ordering note:
+      The DAMAGE processor reads sibling LOAD JSONs to drive the
+      loaded-wagon floor-damage filter.  In the parallel Stage-3
+      ThreadPoolExecutor, this means the damage processor MAY observe
+      an in-progress wagon_states/load/ directory.  The processor
+      `os.path.exists` checks at read time -- if the load file isn't
+      there yet, the floor-damage filter is silently skipped.  In
+      practice the load feature finishes much faster than damage
+      (classification vs detection), so the filter applies to most
+      wagons.
+
+
+================================================================================
+  STAGE 4  fusion/wagon_state_builder.py
+================================================================================
+
+  Merge the four per-feature JSONs into one UnifiedWagonState per
+  GW_n.  Authority rules (codified in build() per spec):
+
+      +------------------------+--------------------------------------+
+      | Field                  | Authority                            |
+      +------------------------+--------------------------------------+
+      | classification         | GlobalTrainState (RIGHT_UP)          |
+      | wagon_identifier (OCR) | RIGHT_UP only                        |
+      | right_door             | features/door  (RIGHT_UP picker)     |
+      | left_door              | features/door  (LEFT_UP picker)      |
+      | load_status            | RIGHT_UP_TOP (LEFT_UP_TOP supports)  |
+      | top_damage             | any TOP camera reporting DAMAGE wins |
+      | side_damage            | reserved for future side-damage feat |
+      +------------------------+--------------------------------------+
+
+  Any feature whose JSON is FAILED / NO_FRAMES / NO_DATA -> that field
+  is set to NO_DATA.  A wagon with zero feature data still gets a
+  UnifiedWagonState carrying just the classification from
+  GlobalTrainState + provenance.
+
+  Anomaly flags (drive PDF row highlight + email summary):
+
+      LEFT_DOOR_OPEN     left_door  == OPEN
+      RIGHT_DOOR_OPEN    right_door == OPEN
+      TOP_DAMAGE         top_damage == DAMAGE
+      SIDE_DAMAGE        side_damage == DAMAGE
+      OCR_MISSING        WAGON-class wagon with wagon_identifier == NO_DATA
+
+  Output: wagon_states/unified/GW_<n>.json (one per global wagon).
+
+
+================================================================================
+  STAGE 4b  rendering/feature_overlay_renderer.py  (VISUALIZATION-ONLY)
+================================================================================
+
+  Produces one rich overlay mp4 per camera (4 mp4s total) from
+  already-persisted artifacts.  NEVER invokes any detector model.
+
+  Inputs (all read from disk):
+      * GlobalTrainState                (in-memory dataclass)
+      * UnifiedWagonState (per wagon)   (in-memory dict)
+      * evidence/<GW>/<feat>/metadata.json
+            door  -> sides.left.{camera_id, frame_idx, bbox, state, confidence}
+                     sides.right.{...}
+            ocr   -> {camera_id, frame_idx, bbox, full_number, ocr_confidence}
+            damage-> tracks[].{camera_id, best_frame_idx, bbox, class_name,
+                              best_confidence}
+      * per_camera_tracking.json        (per-camera fps, total_frames,
+                                          width/height, tracked gaps with
+                                          start_frame / end_frame /
+                                          confidence / track_id)
+
+  Visual elements per frame:
+      * MAGENTA wagon-boundary flash (top + bottom border + "GW_BOUNDARY"
+        banner) at +/-3 frames around each wagon's projected camera-local
+        start frame (local_frame = round(wagon.start_time * local_fps)).
+      * Top-left info panel with translucent background:
+            Camera, Frame N/total, Total Wagons, Current GW_n, Class +
+            confidence, OCR, doors L/R, Load + Damage.  Lines flip to
+            red when the current wagon's anomaly flags are set.
+      * Feature-detection bboxes drawn on the exact best-frame indices
+        recorded in evidence metadata, persisted +/- 30 frames so they
+        are visible at normal playback speed.  Cameras -> features:
+            RIGHT_UP  -> door (right side) + OCR
+            LEFT_UP   -> door (left side)
+            RIGHT_UP_TOP / LEFT_UP_TOP  -> damage tracks
+      * Bottom banner:
+            RED  "GW_n  ANOMALY1, ANOMALY2"  while inside an anomalous
+                 wagon's span
+            YELLOW "GAP #N  conf=X.XX"        while inside a tracked-gap
+                 span (when the wagon has no anomalies)
+
+  Parallelism: ThreadPoolExecutor(4) -- one thread per camera, since
+  OpenCV decode releases the GIL.  Per-camera failures are isolated;
+  the other 3 cameras still complete.
+
+  Output: <batch_root>/processed_videos/<CAM>_processed.mp4
+
+  Failure policy:
+      Per-camera render failure -> log + continue; that camera is
+                                    omitted from processed_video_urls
+                                    but the batch does NOT abort.
+      Missing per_camera_tracking.json -> no gap banners; everything
+                                    else still rendered.
+      Missing evidence_root            -> no feature bboxes; everything
+                                    else still rendered.
+
+
+================================================================================
+  STAGE 5b  reporting/combined_train_report.py
+================================================================================
+
+  Runs AFTER Stage 5a.  Aggregates the four camera reports into the
+  unified train view and links to them from the DETAILED CAMERA REPORTS
+  table (LEFT / RIGHT / R-TOP / L-TOP).  The cross-camera authority
+  resolution itself was already done by Stage 4 fusion; this stage simply
+  presents the unified result in the legacy combined format.
+
+  Two deterministic artefacts emitted to reports/:
+
+      combined_train_report.json   schema "wagon_eye.combined_report.v4"
+      combined_train_report.pdf    (reportlab, A4 landscape, legacy
+                                    WagonEye visual identity)
+
+  PDF structure:
+
+      Page 1
+        Header banner (batch_key + timestamp).
+        Train summary table:
+            TOTAL WAGONS | ENGINES | BRAKE VANS
+            REGULAR WAGONS | OCR CAPTURED | MASTER CAMERA
+            L DOORS OPEN | R DOORS OPEN | ANOMALIES
+            LOADED | EMPTY | TOP DAMAGED
+        Video URL table (if URLs supplied in continuous mode):
+            RAW VIDEO + PROCESSED VIDEO per camera.
+            (PROCESSED URLs point to Stage-4b rich overlays.)
+
+      Pages 2..N
+        Wagon inspection table; one row per GW_n.
+            SR | GW | CLASS | OCR | L_DOOR | R_DOOR | LOAD |
+            TOP_DMG | SIDE_DMG | CONF
+          Row backgrounds:
+            red    if has_open_door OR has_damage
+            amber  if classification == ENGINE
+            blue   if classification == BRAKE_VAN
+
+      Anomaly Evidence pages (v3, only when evidence_root is supplied
+                              AND anomalies exist)
+        One page per anomalous wagon containing a 2x2 thumbnail grid:
+            door_left_best  | door_right_best
+            DOOR_L state    | DOOR_R state (caption)
+            damage_track_1  | ocr_best_frame
+            TOP_DMG/SIDE_DMG| OCR + confidence (caption)
+        Each thumbnail loaded from evidence/<GW>/<feat>/*.jpg; missing
+        snapshots render as a "[no evidence]" placeholder so layout is
+        stable.
+
+      Final page (only if anomalies exist)
+        Bulleted list of every flagged GW_n with its anomalies.
+
+  JSON schema (machine-readable mirror):
+
+      {
+        "schema":         "wagon_eye.combined_report.v4",
+        "batch_key":      "...",
+        "generated_at":   "YYYY-MM-DDTHH:MM:SS+05:30",
+        "train_metadata": {master_camera, master_fps, master_total_frames,
+                           source_video_urls, processed_video_urls},
+        "summary":        {total_wagons, engine_count, wagon_count,
+                           brake_van_count, left_doors_open,
+                           right_doors_open, loaded, empty, top_damaged,
+                           side_damaged, ocr_captured},
+        "stage0_fallback_used":    bool,
+        "stage0_fallback_reason":  "...",
+        "stage0_corrections_applied": [...],
+        "per_camera_local_counts": {...},
+        "wagons":          [UnifiedWagonState.to_dict(), ...],
+        "evidence_pages":  {                   # added in v3
+            "GW_n": {
+                "door_left_best":   "GW_n/door/left_best.jpg",
+                "door_right_best":  "GW_n/door/right_best.jpg",
+                "ocr_best_frame":   "GW_n/ocr/best_frame.jpg",
+                "damage_track_1":   "GW_n/damage/track_1.jpg",
+                ...
+            },
+            ...
+        },
+        "legacy_view_model": {                 # NEW in v4
+            "summary_kpis": {
+                "total_wagons": int, "engine_count": int,
+                "brake_van_count": int, "wagon_count": int,
+                "left_open": int, "right_open": int,
+                "top_damages": int, "left_top_damages": int,
+                "left_partial": int, "right_partial": int,
+                "loaded_count": int, "empty_count": int,
+                "ocr_captured": int,
+                "rake_type": "LOADED RAKE" | "EMPTY RAKE" | "N/A",
+                "status":    "OK" | "NOT OK",
+                "loco_numbers": [],
+            },
+            "state_counts": {"OPEN": int, "CLOSED": int, ...},
+            "merged_wagons": [
+                {"wagon_sr_no": int, "ocr_wagon_number": str,
+                 "left_doors_text": "DOOR 1 OPEN", ...,
+                 "has_open_left": bool, "has_open_right": bool,
+                 "has_open_top": bool, "has_open_left_top": bool,
+                 "wagon_type": "LOADED"|"EMPTY"|"-", ...},
+                ...
+            ],
+        },
+      }
+      evidence_pages paths are RELATIVE to evidence_root (portable).
+      legacy_view_model is the same view-model the PDF renderer uses --
+      external consumers that want the legacy numbers can read it
+      verbatim without re-deriving anything from `wagons[]`.
+
+  Failure policy:
+      JSON write always succeeds (or orchestrator aborts).
+      PDF write may fail (reportlab missing / fonts / size) ->
+          batch marked report_failed; JSON still uploaded;
+          email is suppressed.
+
+
+================================================================================
+  STAGE 5a  reporting/camera_reports.py  (CAMERA-WISE PDFs)
+================================================================================
+
+  Reproduces the legacy WagonEye camera-wise reporting hierarchy.  Four
+  reportlab PDFs emitted to reports/ -- ONE PER CAMERA -- built BEFORE
+  the combined report so it can link them:
+
+      right_up_report.pdf       authority: right door, OCR, classification
+      left_up_report.pdf        authority: left door
+      right_up_top_report.pdf   authority: load, top damage
+      left_up_top_report.pdf    authority: top-damage support / validation
+
+  Each camera report shows ONLY what that camera is authoritative for,
+  and uses snapshots from THAT camera only.
+
+  Page order (A4 landscape):
+
+      1. Camera Summary page
+           navy "<CAMERA> CAMERA REPORT" banner + IST timestamp
+           "Authoritative for: ..." teal line
+           4 KPI cards: VISIBLE WAGONS (n/total), DETECTED ANOMALIES,
+                        PROCESSING CONFIDENCE (avg of the camera's
+                        authoritative confidences), COVERAGE %
+                        (wagons with >=1 cache frame for this camera)
+           Detection Summary table (authority-specific metrics)
+
+      2. Per-wagon pages  (anomalous wagons first, then serial order)
+           - non-wagon (ENGINE / BRAKEVAN) on top cameras -> single
+             simple page ("NOT COUNTED AS WAGON")
+           - else: 2x2 quartile wagon-overview page from this camera's
+             wagon_cache frames (or "NOT VISIBLE TO THIS CAMERA"), then
+             one state-tinted detail page per camera-authoritative
+             detection that has a snapshot or an anomaly.
+
+      3. Camera Anomaly Summary
+           grouped by severity (HIGH = open door / damage, MEDIUM =
+           partial closed, LOW = OCR missing / load no-data), each a
+           SR.NO | GW ID | ANOMALY table.
+
+      4. Camera Evidence section
+           legacy snapshot grid (info row + 2-column image grid) for the
+           camera's flagged wagons.
+
+  Camera authority -> per-wagon content:
+      RIGHT_UP      right door (state+conf+snapshot), OCR
+                    (number+conf+snapshot), classification confidence.
+                    Anomalies: RIGHT_DOOR OPEN/DAMAGE (HIGH),
+                    OCR_MISSING on WAGON-class (LOW).
+      LEFT_UP       left door.  Anomalies: LEFT_DOOR OPEN/DAMAGE (HIGH),
+                    PARTIAL CLOSED (MEDIUM).
+      RIGHT_UP_TOP  load status (authoritative) + top-damage tracks whose
+                    camera_id == RIGHT_UP_TOP.  Anomalies: TOP_DAMAGE
+                    (HIGH), LOAD_NO_DATA on WAGON-class (LOW).
+      LEFT_UP_TOP   top-damage tracks whose camera_id == LEFT_UP_TOP +
+                    a load-validation line corroborating RIGHT_UP_TOP.
+                    Anomalies: TOP_DAMAGE (support) (HIGH).
+
+  Inputs (read-only): GlobalTrainState, UnifiedWagonState,
+  wagon_states/<feature>/<gw>.json, evidence/<gw>/<feature>/, and
+  wagon_cache/<gw>/<cam_folder>/ frames.  No detector / model loads.
+
+  Failure policy:
+      Each camera's PDF is independent.  reportlab failure on one camera
+      returns None for that camera only; the other three camera reports
+      and the combined report are unaffected.
+
+
+================================================================================
+  STAGE 6  delivery/{s3_upload,notification}.py
+================================================================================
+
+  ONE upload + ONE email per batch, regardless of camera count.
+
+  PDF upload  delivery.s3_upload.upload_pdf()
+        primary  POST to UPLOAD_API_URL (microservice) with
+                 product_name="CCTV-WagonEye-CombinedReports",
+                 folder_name=today (IST).
+        fallback S3 direct PUT to
+                 s3://<output_bucket>/train_batch/<key>/reports/...
+        Called once for combined_train_report.pdf AND once each for the
+        4 camera reports (right_up_report.pdf / left_up_report.pdf /
+        right_up_top_report.pdf / left_up_top_report.pdf).
+
+  JSON upload delivery.s3_upload.upload_json()
+        S3 direct PUT with ContentType "application/json".
+
+  Tree archive delivery.s3_upload.upload_tree()
+        Recursive upload of:
+            global_state/      (JSON files only; JPEGs skipped)
+            wagon_states/      (small JSONs, all)
+            reports/           (combined PDF + JSON + 4 camera PDFs)
+            evidence/          (per-wagon JPEGs + metadata)
+            processed_videos/  (Stage 4b rich overlays)
+        wagon_cache/ JPEGs are NOT uploaded by default (too large; can
+        always be re-materialised from the source videos).
+
+  The processed_video_urls passed into Stage 5 are pre-computed
+  deterministically by the orchestrator using the same S3 key scheme
+  upload_tree() will produce, so the combined report can embed the
+  URLs before Stage 6 actually uploads (avoiding a circular dependency).
+
+  Email  delivery.notification.send_email()
+        POST to EMAIL_API_URL.  Body context includes:
+            subject = "WagonEye Combined Report | v4 | <batch_key> |
+                       wagons=N | <DD-MM-YYYY HH:MM>"
+            report_url, json_url, cameras_present, cameras_missing,
+            total_wagons, loaded, empty, open_doors, top_damaged,
+            status, mode = "TRAIN-STATE-NATIVE"
+        3 retries with backoff on failure.
+
+  Exactly-once (delivery.finalization)
+        A per-batch marker delivery/finalization.json records what was
+        delivered (upload_urls, report hashes, email idempotency key).
+        On a restart, an already-completed upload/email for the current
+        report revision is skipped -- no duplicate uploads, no duplicate
+        email.  The marker is written AFTER upload and BEFORE email so a
+        crash in between resumes without re-uploading and still emails.
+
+  OPTIONAL legacy-dashboard ingest  delivery.dashboard_ingest
+        DEFAULT ON (v1) -- disable with WAGONEYE_DASHBOARD_INGEST_ENABLED=false.
+        A read-only Stage-6 adapter that RE-DERIVES the old per-camera
+        "*_inspection.json" dashboard feed from finalized artifacts
+        (reports/combined_train_report.json + evidence/ + finalization.json)
+        and (a) uploads one legacy inspection JSON per present camera to the
+        inspection bucket and (b) POSTs {camera_id, inspection_s3_uri,
+        version} to the cctv-receiver ingest API, with retries + a per-camera
+        idempotency key.  Guarantees: it never runs a model, never touches
+        GlobalTrainState / features / fusion / reports, writes only under
+        delivery/, and any failure is logged + recorded but cannot change the
+        batch's terminal outcome.  Degraded fields (documented in the payload
+        under inspection_data._adapter): direction="unknown", rake_status from
+        fused load, loco frames/OCR empty, wagon galleries synthesized only
+        from evidence that exists.  KEEP OFF in production until the dashboard
+        team confirms the payload.  See the env flags in CONFIGURATION below.
+
+
+================================================================================
+================================================================================
+  features/inference_lib/ -- MATURE INTELLIGENCE REFERENCE
+================================================================================
+================================================================================
+
+  Every legacy heuristic was ported into this subpackage.  The
+  feature processors call into these classes from a frame iterator;
+  none of these modules depends on `wagon_timeline`, `process_video`,
+  or `cv2.VideoCapture`.
+
+  +-----------------------------+--------------------------------------+
+  | door_tracker.py             | DoorTracker, DoorTrack, DoorState,   |
+  |                             | StateMachine, TrackMemory,           |
+  |                             | KalmanFilter, ContextSimilarityCheck,|
+  |                             | DecisionLogic, yolo_to_detections    |
+  |                             | (1500+ lines of mature tracking)     |
+  +-----------------------------+--------------------------------------+
+  | door_identity_merger.py     | DoorIdentityMerger,                  |
+  |                             | merge_all_tracks(...) --             |
+  |                             | spatial 0.40 + temporal 0.15 +       |
+  |                             | context 0.25 + structural 0.20       |
+  |                             | -> merge if >= 0.85                  |
+  +-----------------------------+--------------------------------------+
+  | illumination_processor.py   | IlluminationProcessor,               |
+  |                             | IlluminationResult, IlluminationConf |
+  |                             | quality score (brightness 0.20,      |
+  |                             | glare 0.35, shadow 0.35,             |
+  |                             | uniformity 0.10)                     |
+  +-----------------------------+--------------------------------------+
+  | geometric_shape_prior.py    | GeometricShapePrior,                 |
+  |                             | GeometricPriorConfig                 |
+  |                             | aspect 0.15-2.0 (pref 0.50),         |
+  |                             | vertical-edge >= 0.80,               |
+  |                             | border-completeness >= 0.01          |
+  +-----------------------------+--------------------------------------+
+  | snapshot_selector.py        | SnapshotSelector                     |
+  |                             | weights: completeness 2.0, size 1.5, |
+  |                             | sharpness 1.0 (Laplacian variance),  |
+  |                             | center 1.5, confidence 1.5,          |
+  |                             | balance 1.0                          |
+  +-----------------------------+--------------------------------------+
+  | wagon_number_ocr.py         | WagonNumberOCR (easyocr-based),      |
+  |                             | WagonNumber dataclass,               |
+  |                             | WagonNumberValidator,                |
+  |                             | preprocess_crop (6 steps),           |
+  |                             | _correct_wagon_type_digits           |
+  +-----------------------------+--------------------------------------+
+  | wagon_number_aggregator.py  | WagonNumberAggregator,               |
+  |                             | AggregatorConfig                     |
+  |                             | min_frame_count=2, min_conf=0.30,    |
+  |                             | exact-string + digit-level voting    |
+  +-----------------------------+--------------------------------------+
+  | damage_tracker.py           | DamageTracker, DamageTrack,          |
+  |                             | DamageDetection,                     |
+  |                             | DamageTrackerConfig, KalmanFilter,   |
+  |                             | TrackMemory, TrackState enum,        |
+  |                             | yolo_to_damage_detections            |
+  +-----------------------------+--------------------------------------+
+
+  Cross-import:
+      door_identity_merger uses ContextSimilarityChecker from
+      door_tracker (relative import inside the subpackage).
+
+  Pure intelligence -- no dependency on the legacy orchestration:
+      $ grep -r 'wagon_timeline\|process_video\|cv2\.VideoCapture' \
+              wagon_eye_v4/features/inference_lib/
+      <no matches>
+
+
+================================================================================
+  STATE PERSISTENCE (continuous mode)
+================================================================================
+
+  processed_batches.json at
+      s3://<output_bucket>/master_runner/processed_batches.json
+
+  Read on startup (run_auto), updated after each completed batch.
+
+  Statuses written:
+      completed              all features present, no NO_DATA cells
+      completed_partial      at least one (feature, GW_n) NO_DATA / FAILED
+      report_failed          PDF generation crashed; JSON exists
+      failed_no_global_state Stage 1 aborted; no GlobalTrainState
+      failed                 anything else (download, materializer crash)
+
+
+================================================================================
+  END-TO-END FLOW DIAGRAM
+================================================================================
+
+   +-----------------------------------------------------------------+
+   |                 orchestrator/master_runner.py                   |
+   |                                                                 |
+   |   [poll/select  OR  scan local folder]                          |
+   |              |                                                  |
+   |              v                                                  |
+   |   +-----------------------------------------------------+       |
+   |   |  download all 4 videos  ->  downloads/              |       |
+   |   +--------------+--------------------------------------+       |
+   |                  v                                              |
+   |   +-----------------------------------------------------+       |
+   |   | STAGE 1  reconstruction/runner.py                   |       |
+   |   |   subprocess wagon_count/run_global_count.py        |       |
+   |   |   --no-frames  (wagon_count tracking overlay mp4s   |       |
+   |   |                  kept as debug artifacts)           |       |
+   |   |   -> global_state/global_train_state.json           |       |
+   |   |   -> global_state/per_camera_tracking.json          |       |
+   |   |   -> global_state/processed_videos/*_processed.mp4  |       |
+   |   |   FAIL -> abort batch (failed_no_global_state)      |       |
+   |   +--------------+--------------------------------------+       |
+   |                  v                                              |
+   |   +-----------------------------------------------------+       |
+   |   | STAGE 2  materializer/wagon_cache_builder.py        |       |
+   |   |   single-pass cv2.VideoCapture per camera           |       |
+   |   |   -> wagon_cache/GW_<n>/<cam>/frame_<NNNNNN>.jpg    |       |
+   |   +--------------+--------------------------------------+       |
+   |                  v                                              |
+   |   +-----------------------------------------------------+       |
+   |   | STAGE 3  features/  (4 threads in parallel)         |       |
+   |   |                                                     |       |
+   |   | door:   IlluminationQuality + GeometricPrior +     |       |
+   |   |         DoorTracker (Kalman+FSM+TrackMemory) +     |       |
+   |   |         DoorIdentityMerger                         |       |
+   |   |                                                     |       |
+   |   | ocr:    YOLO + 6-step preprocessing +              |       |
+   |   |         easyocr + wagon-type correction +          |       |
+   |   |         WagonNumberAggregator (digit voting)       |       |
+   |   |                                                     |       |
+   |   | load:   YOLO classification + >35% LOADED rule +    |       |
+   |   |         ENGINE/BRAKE_VAN gate                      |       |
+   |   |                                                     |       |
+   |   | damage: per-frame filter (conf/area/skip/edge) +    |       |
+   |   |         DamageTracker (Kalman+Hungarian+voting) +   |       |
+   |   |         cross-track dedup +                        |       |
+   |   |         LOADED-wagon floor-damage filter           |       |
+   |   |                                                     |       |
+   |   |   -> wagon_states/{feature}/GW_*.json               |       |
+   |   |   -> evidence/<GW>/<feat>/*.jpg + metadata.json     |       |
+   |   |   per-wagon failure -> NO_DATA, continue            |       |
+   |   +--------------+--------------------------------------+       |
+   |                  v                                              |
+   |   +-----------------------------------------------------+       |
+   |   | STAGE 4  fusion/wagon_state_builder.py              |       |
+   |   |   merge per-feature JSONs by authority rules        |       |
+   |   |   -> wagon_states/unified/GW_*.json                 |       |
+   |   +--------------+--------------------------------------+       |
+   |                  v                                              |
+   |   +-----------------------------------------------------+       |
+   |   | STAGE 4b rendering/feature_overlay_renderer.py      |       |
+   |   |   visualization-only.  Reads state + evidence +     |       |
+   |   |   per_camera_tracking.json; NEVER invokes any       |       |
+   |   |   detector model.                                   |       |
+   |   |   4 threads -> 4 overlay mp4s                       |       |
+   |   |   -> processed_videos/<CAM>_processed.mp4           |       |
+   |   |   per-camera fail -> log + continue                 |       |
+   |   +--------------+--------------------------------------+       |
+   |                  v                                              |
+   |   +-----------------------------------------------------+       |
+   |   | STAGE 5a reporting/camera_reports.py                |       |
+   |   |   4 CAMERA-WISE PDFs (legacy hierarchy), each       |       |
+   |   |   scoped to that camera's authority:               |       |
+   |   |     right_up / left_up / right_up_top / left_up_top |       |
+   |   |   camera summary + per-wagon pages + anomaly        |       |
+   |   |   summary by severity + camera evidence            |       |
+   |   |   -> reports/<camera>_report.pdf                    |       |
+   |   |   per-camera failure independent                   |       |
+   |   +--------------+--------------------------------------+       |
+   |                  v                                              |
+   |   +-----------------------------------------------------+       |
+   |   | STAGE 5b reporting/combined_train_report.py         |       |
+   |   |   aggregates the 4 camera reports -> unified view   |       |
+   |   |   reportlab PDF (schema v4) + canonical JSON        |       |
+   |   |   DETAILED CAMERA REPORTS links + KPIs + wagon      |       |
+   |   |   table + Damaged Wagon Report evidence grid        |       |
+   |   |   -> reports/combined_train_report.{pdf,json}       |       |
+   |   |   PDF crash -> report_failed; JSON still produced   |       |
+   |   +--------------+--------------------------------------+       |
+   |                  v                                              |
+   |   +-----------------------------------------------------+       |
+   |   | STAGE 6  delivery/                                  |       |
+   |   |   upload combined PDF + 4 camera PDFs               |       |
+   |   |   (microservice -> S3 fallback)                     |       |
+   |   |   upload JSON (S3)                                  |       |
+   |   |   archive tree (global_state, wagon_states,         |       |
+   |   |                 reports, evidence, processed_videos)|       |
+   |   |   send ONE email                                    |       |
+   |   +--------------+--------------------------------------+       |
+   |                  v                                              |
+   |   +-----------------------------------------------------+       |
+   |   |  save_batch_state(...) -> processed_batches.json    |       |
+   |   |  loop back to poll  (continuous mode)               |       |
+   |   +-----------------------------------------------------+       |
+   +-----------------------------------------------------------------+
+
+
+================================================================================
+  FAILURE HANDLING MATRIX
+================================================================================
+
+  +-----------------------------------+-------------------------------+
+  | Failure                           | Outcome                       |
+  +-----------------------------------+-------------------------------+
+  | Stage 0  fewer than 4 cameras     | failed_no_global_state.       |
+  +-----------------------------------+-------------------------------+
+  | Stage 1  subprocess exit != 0  OR | failed_no_global_state.       |
+  |          0 wagons                  | Batch aborted.                |
+  +-----------------------------------+-------------------------------+
+  | Stage 2  one video unreadable     | That camera's cache subtree   |
+  |                                   | empty; other cameras still    |
+  |                                   | populated.  completed_partial.|
+  +-----------------------------------+-------------------------------+
+  | Stage 2  unhandled exception      | failed.                       |
+  +-----------------------------------+-------------------------------+
+  | Stage 3.A  door_state.pt missing  | NO_DATA every wagon; pipeline |
+  |                                   | continues.                    |
+  +-----------------------------------+-------------------------------+
+  | Stage 3.B  wagon_id_counting.pt   | NO_DATA every wagon.          |
+  |            OR easyocr missing     |                               |
+  +-----------------------------------+-------------------------------+
+  | Stage 3.C  loaded.pt missing      | NO_DATA every wagon.          |
+  +-----------------------------------+-------------------------------+
+  | Stage 3.D  damage.pt missing      | NO_DATA every wagon.          |
+  +-----------------------------------+-------------------------------+
+  | Stage 3  per-wagon crash within   | {"status": "FAILED", "error": |
+  |          ONE feature              | "..."} for that wagon; rest   |
+  |                                   | continues.                    |
+  +-----------------------------------+-------------------------------+
+  | Stage 3  entire feature crashes   | All its GW_n JSONs missing;   |
+  |                                   | Stage-4 treats every wagon as |
+  |                                   | NO_DATA for that feature.     |
+  +-----------------------------------+-------------------------------+
+  | Stage 4  per-wagon fusion error   | Partial UnifiedWagonState;    |
+  |                                   | report still generated.       |
+  +-----------------------------------+-------------------------------+
+  | Stage 4b one camera render fails  | That camera's mp4 missing;    |
+  |                                   | other cameras still produced. |
+  |                                   | processed_video_urls omits    |
+  |                                   | that camera; batch continues. |
+  +-----------------------------------+-------------------------------+
+  | Stage 4b missing evidence_root /  | Renderer still emits mp4s;    |
+  |          per_camera_tracking.json | only the corresponding overlay|
+  |                                   | layer (feature bboxes / gap   |
+  |                                   | banners) is skipped.          |
+  +-----------------------------------+-------------------------------+
+  | Stage 5a one camera PDF fails     | That camera's PDF missing;    |
+  |                                   | other 3 camera PDFs + the     |
+  |                                   | combined report unaffected.   |
+  +-----------------------------------+-------------------------------+
+  | Stage 5b combined PDF raises      | report_failed.  JSON still    |
+  |                                   | written + uploaded; no email. |
+  +-----------------------------------+-------------------------------+
+  | Stage 6  PDF microservice down    | S3-direct fallback URL used.  |
+  +-----------------------------------+-------------------------------+
+  | Stage 6  S3 upload error          | URL is None; email suppressed.|
+  +-----------------------------------+-------------------------------+
+  | Stage 6  email API down           | 3 retries with backoff; logged|
+  +-----------------------------------+-------------------------------+
+
+
+================================================================================
+  DETERMINISM GUARANTEES
+================================================================================
+
+  Given the same 4 videos, the same 8 .pt model files, the same easyocr
+  model assets, and the same CLI flags, the pipeline produces
+  byte-equivalent global_train_state.json AND combined_train_report.json.
+
+      Stage 1   wagon_count uses deterministic sort keys.  YOLO is
+                deterministic given fixed weights + device + half=False.
+
+      Stage 2   single-pass per video; frame_idx is a running counter;
+                cv2.imwrite is deterministic.
+
+      Stage 3   Per-feature voting uses
+                  (-count, -mean_confidence, alpha) tiebreaks.
+                Kalman state is deterministic given the same
+                initialization (the legacy trackers seed velocity to
+                zero with high covariance).
+                Hungarian assignment uses scipy.optimize.linear_sum_assignment
+                which is deterministic.
+                easyocr is deterministic given the same model + GPU
+                flag + half flag.
+
+      Stage 4   Fusion ingests features in fixed order
+                  (door, load, damage, ocr).
+                Provenance sets are sorted before serialization.
+
+      Stage 5   PDF row order = GlobalTrainState wagon order; JSON key
+                order is fixed.
+
+      Stage 6   Uploads are idempotent (S3 PUT overwrites with identical
+                content).
+
+
+================================================================================
+  CONFIGURATION  (CLI flags + legacy-derived thresholds)
+================================================================================
+
+  +---------------------------+------------+------------------------------+
+  | Flag                      | Default    | Effect                       |
+  +---------------------------+------------+------------------------------+
+  | --auto                    | off        | Continuous S3 polling.       |
+  | --once                    | off        | Process one batch then exit. |
+  | --batch <key>             | None       | Force a specific batch_key.  |
+  | --local-only              | off        | Skip S3; use --local-inputs. |
+  | --local-inputs DIR        | local_inputs| Folder to scan locally.     |
+  | --workspace DIR           | batch_outputs| Output root.                |
+  | --recon-models-dir DIR    | models/reconstruction | Stage-1 models.    |
+  | --feat-models-dir DIR     | models/features       | Stage-3 models.    |
+  | --poll-interval N         | 60         | Continuous-mode poll (sec).  |
+  | --partial-wait N          | 30.0       | Min to wait for missing cam. |
+  | --skip-upload             | off        | Skip Stage 6 uploads/archive.|
+  | --skip-email              | off        | Skip Stage 6 email only.     |
+  +---------------------------+------------+------------------------------+
+
+  Legacy-derived thresholds (preserved exactly inside the processors):
+
+      DOOR (features/door/processor.py + inference_lib/door_tracker.py)
+        confidence floor (early)            : closed_confidence_threshold = 0.69
+        OPEN confidence (FSM)               : open_confidence_threshold   = 0.77
+        partial_confirmation_frames         : 4
+        closed_confirmation_frames          : 4
+        open_confirmation_frames            : 5
+        OPEN -> CLOSED hysteresis multiplier: 2x  (i.e. needs 8 streak)
+        TrackMemory buffer                  : 30 frames
+        Hungarian gate                      : max_center_distance = 150 px
+        Hungarian IoU gate                  : min_iou_threshold   = 0.10
+        Direction gate                      : reject if wrong-direction > 10 px
+        n_init                              : 2
+        max_age                             : 30
+        IdentityMerger threshold            : 0.85
+        Snapshot scoring                    : area*2.0 + center*2.5 +
+                                              conf*1.0 + quality*0.5
+                                              edge penalty 0.30 within 8% edge
+
+      OCR (features/ocr/processor.py + inference_lib/wagon_number_*.py)
+        YOLO det_confidence                 : 0.40
+        crop padding                        : 10 px
+        upscale factor                      : 3.0 (cv2.INTER_CUBIC)
+        NLMeans                             : h=8, hColor=8,
+                                              template=7x7, search=21x21
+        CLAHE                               : clipLimit=3.5, tile=8x8
+        unsharp mask                        : weight 1.5, sigma 3
+        easyocr allowlist                   : "0123456789"
+        wagon_number_length                 : 11
+        wagon-type valid range              : [10, 39]
+        WagonNumberAggregator min_frame_cnt : 2
+        WagonNumberAggregator min_confidence: 0.30
+        WagonNumberAggregator require_validation: True
+
+      LOAD (features/load/processor.py)
+        LOADED ratio threshold              : > 0.35
+        every_nth (frame stride)            : 2  (configurable)
+        ENGINE/BRAKE_VAN gate                : skip
+
+      DAMAGE (features/damage/processor.py + inference_lib/damage_tracker.py)
+        YOLO confidence floor               : 0.55
+        bbox area band                      : [0.005, 0.40] of frame area
+        edge-zone X range to skip            : < 0.12 or > 0.88
+        edge-zone Y range to skip            : < 0.10 or > 0.85
+        edge-zone bypass confidence          : >= 0.70
+        skip-class set                      : {no_damage, wagon, engine,
+                                               tail, brake_van,
+                                               guard_van, background,
+                                               outer_wall_damage}
+        DamageTracker max_center_distance   : 200 px
+        DamageTracker iou_weight            : 0.0  (disabled)
+        DamageTracker n_init                : 2
+        DamageTracker max_age               : 30
+        DamageTracker min_hits_for_decision : 2
+        cross-track dedup                   : same class +
+                                              center dist < 100 px
+                                              OR IoU >= 0.20
+        loaded-wagon floor-damage filter    : drop floor_damage tracks
+                                              if companion load is LOADED
+
+
+================================================================================
+  RUN COMMANDS  (the entry point is always orchestrator/master_runner)
+================================================================================
+
+  Local single-batch (no S3):
+
+      cd wagon_eye_v4
+      python -m orchestrator.master_runner --local-only \
+                                            --local-inputs ./local_inputs
+
+  Continuous production (S3 polling daemon):
+
+      cd wagon_eye_v4
+      python -m orchestrator.master_runner --auto --no-interactive
+
+  Single-batch replay (debug):
+
+      python -m orchestrator.master_runner --batch 20260408_032134
+
+  Single batch then exit (one poll cycle):
+
+      python -m orchestrator.master_runner --once
+
+  Smoke test (no upload/email):
+
+      python -m orchestrator.master_runner --local-only \
+                                            --local-inputs ./local_inputs \
+                                            --skip-upload --skip-email
+
+
+================================================================================
+  END-TO-END DATA FLOW  (one train, one run)
+================================================================================
+
+  1. DISCOVER   train_batch_manager clusters the 4 camera videos that share a
+                t=0 timestamp into one TrainBatch (batch_key = YYYYMMDD_HHMMSS).
+                --auto finds them in S3 (INPUT_BUCKET + INPUT_PREFIXES);
+                --local-only scans --local-inputs.
+  2. WAIT/SEAL  Wait for the RIGHT_UP master; open a short support-fusion
+                window so LEFT_UP / tops can improve gap recovery; then SEAL an
+                immutable GlobalTrainState (Stage 1 counts + numbers + classes).
+                Late cameras after the seal attach FEATURES only -- no recount.
+  3. MATERIALIZE  Stage 2 slices each video into per-wagon frame caches.
+  4. FEATURES   Stage 3 runs door / ocr / load / damage per wagon, writing
+                per-wagon JSON + camera-scoped evidence/<GW>/<feat>/<CAM>/.
+  5. FUSE       Stage 4 fuses features into one UnifiedWagonState per wagon
+                (RIGHT_UP authority for identity/classification).
+  6. RENDER     Stage 4b draws overlay videos (visualization only, no models).
+  7. REPORT     Stage 5a -> 4 per-camera PDFs; Stage 5b -> combined PDF + JSON.
+  8. DELIVER    Stage 6: ONE PDF upload + ONE email (idempotent via
+                delivery/finalization.json); tree archive to S3; mark the
+                batch in master_runner/processed_batches.json.  OPTIONAL:
+                legacy-dashboard ingest (on by default; WAGONEYE_DASHBOARD_INGEST_ENABLED=false to skip).
+
+  Outputs land under  batch_outputs/<batch_key>/  (downloads, global_state,
+  wagon_cache, wagon_states, evidence, processed_videos, reports, delivery,
+  archive) and are mirrored to s3://<output_bucket>/train_batch/<batch_key>/.
+
+
+================================================================================
+  RUNNING ON EC2  (production, end to end)
+================================================================================
+
+  STEP 1 -- clone the repo (branch: global_train) and pick the app root.
+    The pipeline lives in the wagon_eye_v4_new/ subfolder; that folder IS the
+    app root (it contains orchestrator/, core/, ...).
+
+      cd /opt
+      sudo mkdir -p /opt/wagon_eye_repo && sudo chown "$USER":"$USER" /opt/wagon_eye_repo
+      git clone --branch global_train --single-branch \
+        https://github.com/s2pl/CCTV-TrainVideo-ML-V1-wagon-Ankit.git wagon_eye_repo
+      # (private repo -> use a GitHub token: when prompted, Username=your login,
+      #  Password=a Personal Access Token with repo/Contents-read + SSO authorized)
+      sudo ln -sfn /opt/wagon_eye_repo/wagon_eye_v4_new /opt/wagon_eye_v4
+      cd /opt/wagon_eye_v4
+
+  STEP 2 -- install OS packages + venv + Python deps (auto-detects GPU):
+
+      bash scripts/setup_ec2.sh
+
+  STEP 3 -- drop the 8 model weights (dirs were created by setup):
+
+      models/reconstruction/  right_up_gap.pt left_up_gap.pt top_gap.pt
+                              side_classification.pt
+      models/features/        door_state.pt loaded.pt damage.pt
+                              wagon_id_counting.pt
+
+  STEP 4 -- configure the environment (--auto NEEDS the input bucket+prefixes):
+
+      cp deploy/wagon-eye.env.example deploy/wagon-eye.env
+      # edit deploy/wagon-eye.env -- at minimum set:
+      #   WAGONEYE_S3_REGION=ap-south-1
+      #   WAGONEYE_S3_INPUT_BUCKET=<raw-video bucket>
+      #   WAGONEYE_S3_INPUT_PREFIXES=<cam1/>,<cam2/>,<cam3/>,<cam4/>
+      #   WAGONEYE_S3_OUTPUT_BUCKET=biro-wagon-report-biro-copy
+
+  STEP 5 -- dry run in the foreground (no uploads, no email):
+
+      set -a; source deploy/wagon-eye.env; set +a
+      source .venv/bin/activate
+      python -m orchestrator.master_runner --auto --no-interactive \
+             --skip-upload --skip-email
+      # confirm it discovers + processes a batch, then Ctrl+C.
+
+  STEP 6 -- real auto run (foreground):
+
+      python -m orchestrator.master_runner --auto --no-interactive
+
+  STEP 7 -- install as a service (auto-restart + reboot-safe):
+
+      sudo cp deploy/wagon-eye.service /etc/systemd/system/wagon-eye.service
+      # edit the unit: User=, WorkingDirectory=/opt/wagon_eye_v4,
+      #   EnvironmentFile=/opt/wagon_eye_v4/deploy/wagon-eye.env,
+      #   ExecStart=/opt/wagon_eye_v4/.venv/bin/python -m \
+      #             orchestrator.master_runner --auto --no-interactive
+      sudo systemctl daemon-reload
+      sudo systemctl enable --now wagon-eye
+      journalctl -u wagon-eye -f          # live logs
+      # control: systemctl {status|restart|stop} wagon-eye
+      #          (stop = SIGTERM -> finishes the current batch, then exits)
+
+
+================================================================================
+  ENVIRONMENT VARIABLES  (all optional; unset = pre-migration default)
+================================================================================
+
+  Paths / device
+      WAGONEYE_WORKSPACE_ROOT      output root (default <root>/batch_outputs)
+      WAGONEYE_MODELS_DIR          models root (default <root>/models)
+      WAGONEYE_LOG_DIR             log dir     (default <root>/logs)
+      WAGONEYE_DEVICE             cuda | cpu | auto (default auto-detect)
+
+  S3 (required for --auto/--once/--batch)
+      WAGONEYE_S3_REGION           default ap-south-1
+      WAGONEYE_S3_INPUT_BUCKET     raw-video bucket to poll
+      WAGONEYE_S3_INPUT_PREFIXES   comma-separated camera prefixes (REQUIRED)
+      WAGONEYE_S3_OUTPUT_BUCKET    report/archive bucket
+      WAGONEYE_S3_STATE_KEY        processed_batches.json key
+
+  Report microservice + email
+      WAGONEYE_UPLOAD_API_URL / WAGONEYE_EMAIL_API_URL
+      WAGONEYE_EMAIL_RECEIVER / WAGONEYE_EMAIL_RECEIVER_CC / WAGONEYE_PRODUCT_NAME
+
+  Incremental (async-camera) lifecycle
+      WAGONEYE_MASTER_WAIT_MINUTES         default 10
+      WAGONEYE_SUPPORT_FUSION_WAIT_MINUTES default 3
+      WAGONEYE_FINAL_CAMERA_WAIT_MINUTES   default 30
+      WAGONEYE_GENERATE_INTERIM_REPORTS    default true (LOCAL-only)
+      WAGONEYE_UPLOAD_INTERIM_REPORTS      default false
+      WAGONEYE_EMAIL_INTERIM_REPORTS       default false
+      WAGONEYE_LATE_CAMERA_POLICY          default IGNORE
+
+  OPTIONAL legacy-dashboard ingest (delivery/dashboard_ingest.py)
+      WAGONEYE_DASHBOARD_INGEST_ENABLED    default true   <-- master switch (v1)
+      WAGONEYE_INSPECTION_JSON_BUCKET      default ankit-version-1-prod
+      WAGONEYE_INSPECTION_INGEST_API_URL   default .../cctv-receiver/inspections/ingest
+      WAGONEYE_INSPECTION_VERSION          default v1  (dashboard tab)
+      WAGONEYE_INSPECTION_CAMERA_FULL_IDS  JSON map cam -> full CCTV id
+      WAGONEYE_INSPECTION_FOLDERS          JSON map cam -> legacy S3 folder
+      WAGONEYE_DASHBOARD_REUSE_EVIDENCE_URLS  default true (reuse train_batch
+                                              evidence URLs; false = copy JPEGs)
+
+
+================================================================================
+  REQUIRED MODELS  (drop these .pt files into models/)
+================================================================================
+
+  models/reconstruction/
+      right_up_gap.pt           (or right_up_wagon_gap.pt -- both work)
+      left_up_gap.pt            (or left_up_wagon_gap.pt  -- both work)
+      top_gap.pt
+      side_classification.pt
+
+  models/features/
+      door_state.pt             (DETECTION, used by door)
+      loaded.pt                 (CLASSIFICATION, used by load)
+      damage.pt                 (DETECTION, used by damage)
+      wagon_id_counting.pt      (DETECTION, used by ocr)
+
+
+================================================================================
+  WHAT EACH MODEL DOES
+================================================================================
+
+  right_up_gap.pt   / left_up_gap.pt
+      YOLO detection -- inter-wagon gaps in side camera frames.
+      Class: "gap".  Used by wagon_count to build the master gap
+      timeline.  Stage 1 only.
+
+  top_gap.pt
+      YOLO detection -- inter-wagon gaps in top camera frames.
+      Class: "gap".  Used by wagon_count for cross-camera gap-fusion
+      votes.  Stage 1 only.
+
+  side_classification.pt
+      Frame classifier -- ENGINE / WAGON / BRAKE_VAN.  Drives the
+      classification field on every GlobalWagon.  Stage 1 only.
+
+  door_state.pt
+      YOLO detection -- doors + state classes:
+        open / open_door / closed / closed_door /
+        partial_closed / closed_with_wire / damage.
+      Stage 3.A feature.
+
+  loaded.pt
+      YOLO classification (results.probs.top1) -- LOADED vs EMPTY.
+      Stage 3.C feature.
+
+  damage.pt
+      YOLO detection -- top damages: floor_damage / inner_wall_damage /
+      no_damage (outer_wall_damage is filtered out on TOP cameras --
+      it's a side concern).  Stage 3.D feature.
+
+  wagon_id_counting.pt
+      YOLO detection -- wagon-number plate regions.  Each crop is read
+      by easyocr; results aggregated by exact 11-digit string with
+      digit-level voting.  Stage 3.B feature.
+
+
+================================================================================
+  WHAT IS EXPLICITLY NOT IN THIS PACKAGE
+================================================================================
+
+  By design (per the architectural constraints):
+
+      - No RIGHT_UP/, LEFT_UP/, RIGHT_UP_TOP/, LEFT_UP_TOP/ folders.
+      - No DoorProcessor / DamageProcessor wrappers (the legacy
+        process_video() entry points).
+      - No camera_loader.py (legacy isolated-module loader).
+      - No `cv2.VideoCapture` calls for INFERENCE anywhere downstream
+        of Stage 2.  Stage 4b's overlay renderer uses cv2.VideoCapture
+        for VISUALIZATION ONLY -- it consumes already-persisted state
+        and evidence, and never invokes any detector model.
+      - No mini-mp4 reconstruction per wagon.
+      - No wagon-segmentation logic in any feature processor (wagons
+        are fixed by GlobalTrainState).
+      - No legacy combined_report_generator (a fresh reportlab writer
+        is in reporting/combined_train_report.py).
+      - No model loads inside rendering/ or reporting/.  The
+        rendering/feature_overlay_renderer module imports cv2 + numpy
+        only; reporting/{camera_reports,combined_train_report}.py
+        import reportlab only.  Anything else would violate the
+        visualization/inference separation.
+
+  Future work (out of scope for this revision):
+
+      - features/side_damage/ -- a side-camera damage detector using
+        side_damage.pt (or equivalent).  UnifiedWagonState already
+        carries side_damage / side_damage_details fields -- only the
+        detector module needs to be added.
+      - GPU memory pooling across feature processors.
+      - Streaming wagon_cache upload to S3.
+
+
+================================================================================
+                       END OF WAGON EYE v4 WORKFLOW DOCUMENT
+================================================================================

@@ -1,0 +1,355 @@
+<title>WagonEye v4 — Pipeline Map</title>
+<style>
+  :root {
+    --bg:        #eef0f3;
+    --surface:   #ffffff;
+    --surface-2: #f6f7f9;
+    --ink:       #171b21;
+    --ink-soft:  #4b535e;
+    --ink-faint: #79828e;
+    --line:      #d7dbe1;
+    --line-soft: #e6e9ee;
+    --accent:    #b9791b;   /* signal amber, darkened for light-bg contrast */
+    --accent-bg: #fbf1de;
+    --cyan:      #1c7a88;   /* data / state */
+    --cyan-bg:   #e0f1f3;
+    --magenta:   #a63f8c;   /* wagon boundary */
+    --magenta-bg:#f6e6f1;
+    --ok:        #2f7d54;
+    --bad:       #c0392f;
+    --master:    #b9791b;
+
+    --mono: ui-monospace, "Cascadia Code", "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --maxw: 1080px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:        #0f1319;
+      --surface:   #171d25;
+      --surface-2: #1c232c;
+      --ink:       #e7ecf2;
+      --ink-soft:  #aeb7c2;
+      --ink-faint: #7c8792;
+      --line:      #2b333d;
+      --line-soft: #232a33;
+      --accent:    #e0a13a;
+      --accent-bg: #2c2413;
+      --cyan:      #4fc0cf;
+      --cyan-bg:   #123037;
+      --magenta:   #d67ec0;
+      --magenta-bg:#301a2b;
+      --ok:        #55b581;
+      --bad:       #e07a70;
+      --master:    #e0a13a;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg:#eef0f3; --surface:#fff; --surface-2:#f6f7f9; --ink:#171b21; --ink-soft:#4b535e;
+    --ink-faint:#79828e; --line:#d7dbe1; --line-soft:#e6e9ee; --accent:#b9791b; --accent-bg:#fbf1de;
+    --cyan:#1c7a88; --cyan-bg:#e0f1f3; --magenta:#a63f8c; --magenta-bg:#f6e6f1;
+    --ok:#2f7d54; --bad:#c0392f; --master:#b9791b;
+  }
+  :root[data-theme="dark"] {
+    --bg:#0f1319; --surface:#171d25; --surface-2:#1c232c; --ink:#e7ecf2; --ink-soft:#aeb7c2;
+    --ink-faint:#7c8792; --line:#2b333d; --line-soft:#232a33; --accent:#e0a13a; --accent-bg:#2c2413;
+    --cyan:#4fc0cf; --cyan-bg:#123037; --magenta:#d67ec0; --magenta-bg:#301a2b;
+    --ok:#55b581; --bad:#e07a70; --master:#e0a13a;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--sans); line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: clamp(24px,5vw,64px) clamp(16px,4vw,40px) 96px; }
+
+  /* ---------- header ---------- */
+  .eyebrow {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .18em; text-transform: uppercase;
+    color: var(--accent); margin: 0 0 14px; font-weight: 600;
+  }
+  h1 {
+    font-size: clamp(30px, 6vw, 52px); line-height: 1.04; margin: 0 0 18px;
+    font-weight: 780; letter-spacing: -.02em; text-wrap: balance;
+  }
+  .lede { max-width: 62ch; color: var(--ink-soft); font-size: clamp(15px,1.6vw,17px); margin: 0; }
+  .lede b { color: var(--ink); font-weight: 650; }
+
+  .thesis {
+    margin: 28px 0 0; padding: 18px 20px; border-radius: 12px;
+    background: var(--accent-bg); border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
+    display: flex; gap: 14px; align-items: flex-start;
+  }
+  .thesis .badge {
+    font-family: var(--mono); font-size: 11px; font-weight: 700; letter-spacing: .1em;
+    color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+    padding: 3px 8px; border-radius: 6px; white-space: nowrap; margin-top: 2px;
+  }
+  .thesis p { margin: 0; font-size: 14.5px; color: var(--ink); }
+  .thesis code { font-family: var(--mono); color: var(--accent); font-weight: 650; }
+
+  /* ---------- section titles ---------- */
+  .sec-title {
+    display: flex; align-items: baseline; gap: 12px; margin: 56px 0 8px;
+  }
+  .sec-title h2 { font-size: 13px; letter-spacing: .16em; text-transform: uppercase; font-family: var(--mono);
+    margin: 0; color: var(--ink-faint); font-weight: 600; }
+  .sec-title .rule { flex: 1; height: 1px; background: var(--line); }
+
+  /* ---------- camera inputs ---------- */
+  .cams { display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; margin-top: 18px; }
+  .cam {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px; position: relative;
+  }
+  .cam .id { font-family: var(--mono); font-weight: 700; font-size: 14px; letter-spacing: -.01em; }
+  .cam .role { font-size: 12px; color: var(--ink-faint); margin-top: 3px; }
+  .cam.master { border-color: color-mix(in srgb, var(--master) 55%, transparent); background: var(--accent-bg); }
+  .cam.master .id { color: var(--accent); }
+  .cam .tag {
+    position: absolute; top: -9px; right: 10px; font-family: var(--mono); font-size: 10px; font-weight: 700;
+    letter-spacing: .08em; background: var(--accent); color: #17130a; padding: 2px 7px; border-radius: 5px;
+  }
+  :root[data-theme="dark"] .cam.master .tag, .cam .tag { color: #17130a; }
+
+  /* ---------- pipeline spine ---------- */
+  .flow { position: relative; margin-top: 18px; }
+  .flow::before {
+    content: ""; position: absolute; left: 27px; top: 8px; bottom: 40px; width: 2px;
+    background: linear-gradient(var(--line), var(--line)); z-index: 0;
+  }
+  @media (max-width: 640px){ .flow::before { display:none; } }
+
+  .stage {
+    position: relative; display: grid; grid-template-columns: 56px 1fr; gap: 0 20px;
+    margin-bottom: 14px; z-index: 1;
+  }
+  .node {
+    width: 56px; height: 56px; border-radius: 12px; display: grid; place-items: center;
+    background: var(--surface); border: 2px solid var(--line); font-family: var(--mono);
+    font-weight: 780; font-size: 17px; color: var(--ink); z-index: 1;
+  }
+  .stage.render .node { border-style: dashed; color: var(--cyan); border-color: color-mix(in srgb,var(--cyan) 50%,var(--line)); }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px 18px; transition: border-color .16s ease, transform .16s ease;
+  }
+  .card:hover { border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
+  .card .head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+  .card .folder { font-family: var(--mono); font-weight: 700; font-size: 15px; color: var(--accent); }
+  .card .stagelbl { font-size: 11px; font-family: var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--ink-faint); }
+  .card .what { color: var(--ink-soft); font-size: 14.5px; margin: 0 0 12px; }
+  .card .what b { color: var(--ink); font-weight: 640; }
+
+  .io { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12px; }
+  .io .arrow { color: var(--ink-faint); font-family: var(--mono); }
+  .chip {
+    font-family: var(--mono); font-size: 11.5px; padding: 4px 9px; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--surface-2); color: var(--ink-soft);
+    white-space: nowrap;
+  }
+  .chip.state { color: var(--cyan); border-color: color-mix(in srgb,var(--cyan) 35%,transparent); background: var(--cyan-bg); }
+  .chip.report { color: var(--magenta); border-color: color-mix(in srgb,var(--magenta) 35%,transparent); background: var(--magenta-bg); }
+  .chip.gold { color: var(--accent); border-color: color-mix(in srgb,var(--accent) 40%,transparent); background: var(--accent-bg); }
+
+  /* ---------- stage 3 fan ---------- */
+  .features { display: grid; grid-template-columns: repeat(4,1fr); gap: 10px; margin-top: 14px; }
+  .feat { border: 1px solid var(--line); border-radius: 9px; padding: 11px 12px; background: var(--surface-2); }
+  .feat .fname { font-family: var(--mono); font-weight: 700; font-size: 13px; color: var(--cyan); }
+  .feat .fdesc { font-size: 12px; color: var(--ink-soft); margin: 4px 0 6px; }
+  .feat .fmodel { font-family: var(--mono); font-size: 10.5px; color: var(--ink-faint); }
+  .note { font-size: 12px; color: var(--ink-faint); margin: 10px 0 0; font-style: italic; }
+
+  /* ---------- output + authority ---------- */
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 18px; }
+  .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; }
+  .panel h3 { margin: 0 0 12px; font-size: 13px; font-family: var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-faint); font-weight: 600; }
+
+  .tree { font-family: var(--mono); font-size: 12.5px; line-height: 1.9; color: var(--ink-soft); margin: 0; overflow-x: auto; }
+  .tree .d { color: var(--accent); }
+  .tree .c { color: var(--ink-faint); }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line-soft); }
+  th { font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-faint); font-weight: 600; }
+  td.field { color: var(--ink); font-weight: 550; }
+  td.auth { font-family: var(--mono); font-size: 12px; color: var(--cyan); }
+  td.auth .m { color: var(--accent); font-weight: 700; }
+
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 22px; font-size: 12px; color: var(--ink-soft); }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+
+  footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--ink-faint); }
+  footer code { font-family: var(--mono); color: var(--ink-soft); }
+
+  @media (max-width: 760px){
+    .two { grid-template-columns: 1fr; }
+    .features { grid-template-columns: 1fr 1fr; }
+    .cams { grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 520px){
+    .stage { grid-template-columns: 1fr; gap: 8px; }
+    .node { width: 44px; height: 44px; font-size: 15px; }
+    .features { grid-template-columns: 1fr; }
+  }
+  @media (prefers-reduced-motion: reduce){ * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+
+  <p class="eyebrow">WagonEye v4 · pipeline map</p>
+  <h1>From four raw videos to one train inspection report.</h1>
+  <p class="lede">A train rolls past four fixed cameras. This pipeline counts its wagons, inspects each one for open doors, damage, load state and its stencilled number, then ships a PDF + JSON report to S3 and email. <b>Seven stages, one direction of flow.</b></p>
+
+  <div class="thesis">
+    <span class="badge">INVARIANT</span>
+    <p>Only <b>Stage&nbsp;1</b> may count, number, or bound wagons. It produces the <code>GlobalTrainState</code> — the single source of truth. Every later stage <i>reads</i> it and adds detail; nothing ever recounts. <code>RIGHT_UP</code> is the master camera.</p>
+  </div>
+
+  <!-- INPUTS -->
+  <div class="sec-title"><h2>Inputs · 4 cameras</h2><span class="rule"></span></div>
+  <div class="cams">
+    <div class="cam master"><span class="tag">MASTER</span><div class="id">RIGHT_UP</div><div class="role">counting · right door · OCR · class</div></div>
+    <div class="cam"><div class="id">LEFT_UP</div><div class="role">left door</div></div>
+    <div class="cam"><div class="id">RIGHT_UP_TOP</div><div class="role">load · top damage</div></div>
+    <div class="cam"><div class="id">LEFT_UP_TOP</div><div class="role">damage support</div></div>
+  </div>
+
+  <!-- PIPELINE -->
+  <div class="sec-title"><h2>Pipeline · stage by stage</h2><span class="rule"></span></div>
+  <div class="flow">
+
+    <!-- 0 -->
+    <div class="stage">
+      <div class="node">0</div>
+      <div class="card">
+        <div class="head"><span class="folder">orchestrator/</span><span class="stagelbl">acquire batch</span></div>
+        <p class="what"><b>The conductor.</b> Groups the 4 videos into one train batch and runs stages 1→6 in order. In <code>--auto</code> mode it also handles cameras that arrive at different times (resumable lifecycle).</p>
+        <div class="io"><span class="chip">4 × mp4</span><span class="arrow">→</span><span class="chip">TrainBatch</span></div>
+      </div>
+    </div>
+
+    <!-- 1 -->
+    <div class="stage">
+      <div class="node">1</div>
+      <div class="card">
+        <div class="head"><span class="folder">reconstruction/ · wagon_count/</span><span class="stagelbl">count the wagons</span></div>
+        <p class="what">Detects the gaps between wagons, tracks them, fuses the 4 cameras, and assigns <b>GW_1…GW_N</b> ids + ENGINE/WAGON/BRAKE_VAN class. Fails the whole batch if it finds zero wagons.</p>
+        <div class="io"><span class="chip">4 × mp4</span><span class="arrow">→</span><span class="chip state">global_train_state.json</span></div>
+      </div>
+    </div>
+
+    <!-- 2 -->
+    <div class="stage">
+      <div class="node">2</div>
+      <div class="card">
+        <div class="head"><span class="folder">materializer/</span><span class="stagelbl">cut into frames</span></div>
+        <p class="what">Opens each video <b>once</b> and saves its frames as JPEGs, filed per wagon per camera. This is the <b>last</b> place video is ever decoded — everything after reads JPEGs from disk.</p>
+        <div class="io"><span class="chip state">global_train_state</span><span class="arrow">+</span><span class="chip">4 × mp4</span><span class="arrow">→</span><span class="chip">wagon_cache/GW_n/&lt;cam&gt;/*.jpg</span></div>
+      </div>
+    </div>
+
+    <!-- 3 -->
+    <div class="stage">
+      <div class="node">3</div>
+      <div class="card">
+        <div class="head"><span class="folder">features/</span><span class="stagelbl">inspect each wagon · parallel</span></div>
+        <p class="what">Four independent inspectors read the cached frames. Each is a thin driver; the real tracking/OCR intelligence lives in <code>features/inference_lib/</code>. One JSON answer + evidence snapshots per wagon.</p>
+        <div class="features">
+          <div class="feat"><div class="fname">door</div><div class="fdesc">open / closed / partial / damaged</div><div class="fmodel">door_state.pt</div></div>
+          <div class="feat"><div class="fname">ocr</div><div class="fdesc">read 11-digit number</div><div class="fmodel">wagon_id_counting.pt + easyocr</div></div>
+          <div class="feat"><div class="fname">load</div><div class="fdesc">loaded / empty</div><div class="fmodel">loaded.pt</div></div>
+          <div class="feat"><div class="fname">damage</div><div class="fdesc">roof / floor damage</div><div class="fmodel">damage.pt</div></div>
+        </div>
+        <p class="note">A failure is local: one bad wagon → NO_DATA cell, not a dead batch.</p>
+      </div>
+    </div>
+
+    <!-- 4 -->
+    <div class="stage">
+      <div class="node">4</div>
+      <div class="card">
+        <div class="head"><span class="folder">fusion/</span><span class="stagelbl">merge answers</span></div>
+        <p class="what">Combines the four feature JSONs per wagon into one <b>UnifiedWagonState</b> using fixed authority rules, and raises the anomaly flags (door-open, damage, OCR-missing) that later highlight report rows.</p>
+        <div class="io"><span class="chip">door·ocr·load·damage json</span><span class="arrow">→</span><span class="chip state">unified/GW_n.json</span></div>
+      </div>
+    </div>
+
+    <!-- 4b -->
+    <div class="stage render">
+      <div class="node">4b</div>
+      <div class="card">
+        <div class="head"><span class="folder">rendering/</span><span class="stagelbl">overlay videos · visual only</span></div>
+        <p class="what">Re-draws boxes, ids and banners onto the raw videos for review. Runs <b>no AI model</b> — it only paints decisions already made and saved. One processed mp4 per camera.</p>
+        <div class="io"><span class="chip state">unified + evidence</span><span class="arrow">→</span><span class="chip">processed_videos/&lt;cam&gt;.mp4</span></div>
+      </div>
+    </div>
+
+    <!-- 5 -->
+    <div class="stage">
+      <div class="node">5</div>
+      <div class="card">
+        <div class="head"><span class="folder">reporting/</span><span class="stagelbl">build the reports</span></div>
+        <p class="what"><b>5a</b> — four camera-wise PDFs, each scoped to what that camera owns. <b>5b</b> — the combined train report (PDF + JSON, schema v4) with the KPI summary, per-wagon table, and damaged-wagon evidence grid.</p>
+        <div class="io"><span class="chip state">unified + evidence</span><span class="arrow">→</span><span class="chip report">4 × camera.pdf</span><span class="chip report">combined_train_report.pdf / .json</span></div>
+      </div>
+    </div>
+
+    <!-- 6 -->
+    <div class="stage">
+      <div class="node">6</div>
+      <div class="card">
+        <div class="head"><span class="folder">delivery/</span><span class="stagelbl">ship it · exactly once</span></div>
+        <p class="what">Uploads the reports + evidence tree to S3 and sends <b>one</b> email per batch. A finalization marker guarantees a restart never uploads or emails twice.</p>
+        <div class="io"><span class="chip report">reports</span><span class="arrow">→</span><span class="chip gold">S3 archive</span><span class="chip gold">1 email</span></div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- OUTPUT + AUTHORITY -->
+  <div class="sec-title"><h2>Reference</h2><span class="rule"></span></div>
+  <div class="two">
+    <div class="panel">
+      <h3>Output tree · per batch</h3>
+      <pre class="tree"><span class="d">downloads/</span>        <span class="c"># raw videos</span>
+<span class="d">global_state/</span>     <span class="c"># the wagon count</span>
+<span class="d">wagon_cache/</span>      <span class="c"># per-wagon JPEG frames</span>
+<span class="d">wagon_states/</span>     <span class="c"># feature json + unified/</span>
+<span class="d">evidence/</span>         <span class="c"># best-frame proof snaps</span>
+<span class="d">processed_videos/</span> <span class="c"># overlay mp4s</span>
+<span class="d">reports/</span>          <span class="c"># 4 camera + combined</span>
+<span class="d">delivery/</span>         <span class="c"># finalization marker</span>
+<span class="d">manifest.json</span>     <span class="c"># resumable state</span></pre>
+    </div>
+    <div class="panel">
+      <h3>Authority · who decides what</h3>
+      <table>
+        <thead><tr><th>Field</th><th>Decided by</th></tr></thead>
+        <tbody>
+          <tr><td class="field">classification</td><td class="auth"><span class="m">GlobalTrainState</span></td></tr>
+          <tr><td class="field">wagon number</td><td class="auth"><span class="m">RIGHT_UP</span> ocr</td></tr>
+          <tr><td class="field">right door</td><td class="auth"><span class="m">RIGHT_UP</span></td></tr>
+          <tr><td class="field">left door</td><td class="auth">LEFT_UP</td></tr>
+          <tr><td class="field">load status</td><td class="auth">RIGHT_UP_TOP<span class="c"> → LEFT_UP_TOP</span></td></tr>
+          <tr><td class="field">top damage</td><td class="auth">any TOP w/ DAMAGE</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span><span class="dot" style="background:var(--accent)"></span> folder / master authority</span>
+    <span><span class="dot" style="background:var(--cyan)"></span> state &amp; cache data</span>
+    <span><span class="dot" style="background:var(--magenta)"></span> reports</span>
+  </div>
+
+  <footer>
+    Companion to <code>function_workflow.txt</code> (file-by-file guide) and <code>complate_workflow.txt</code> (deep algorithm reference). &nbsp;·&nbsp; Support code lives in <code>core/</code>; trained weights in <code>models/</code>.
+  </footer>
+
+</div>

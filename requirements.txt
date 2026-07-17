@@ -1,0 +1,27 @@
+# WagonEye v4 -- train-state-native production pipeline
+# Tested on Python 3.10+
+
+# Core ML / vision
+ultralytics>=8.0.0
+opencv-python-headless>=4.7.0
+numpy>=1.23.0
+scipy>=1.10.0
+filterpy>=1.4.5
+Pillow>=9.5.0
+
+# PyTorch (drop to a CUDA wheel on GPU instances)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# OCR
+easyocr>=1.7.0
+
+# Report generation (fresh reportlab implementation -- no legacy PDF dep)
+reportlab>=4.0.0
+
+# AWS + HTTP
+boto3>=1.28.0
+requests>=2.31.0
+
+# imageio for the wagon_count overlay path (kept by Stage 1)
+imageio-ffmpeg>=0.4.9

@@ -1,0 +1,31 @@
+# systemd unit for the WagonEye train-EXTRACTION producer (raw -> trimmed).
+#
+# This service ONLY cuts the train pass out of raw CCTV and uploads the trimmed
+# clips to the bucket that wagon-eye.service (--auto inspection) polls.  Run the
+# two together: extraction produces, inspection consumes.
+#
+# INSTALL:
+#   1. Edit User / WorkingDirectory / EnvironmentFile below.
+#   2. sudo cp deploy/wagon-eye-extraction.service /etc/systemd/system/
+#   3. sudo systemctl daemon-reload && sudo systemctl enable --now wagon-eye-extraction
+#   4. journalctl -u wagon-eye-extraction -f
+
+[Unit]
+Description=WagonEye train-extraction producer (raw CCTV -> trimmed clips)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/wagon_eye_v4
+EnvironmentFile=-/opt/wagon_eye_v4/deploy/wagon-eye-extraction.env
+ExecStart=/opt/wagon_eye_v4/.venv/bin/python -m train_extraction.run_extraction_service
+Restart=on-failure
+RestartSec=15
+KillSignal=SIGTERM
+TimeoutStopSec=300
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

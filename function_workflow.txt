@@ -1,0 +1,377 @@
+================================================================================
+       WAGON EYE v4 -- FUNCTION / FILE-BY-FILE WORKFLOW GUIDE
+       "Which folder / which file does what"
+================================================================================
+
+  Read this file if you want to understand the WHOLE codebase quickly:
+  it lists every folder and every file in wagon_eye_v4_new/ and says, in
+  one or two plain lines, WHAT IT DOES and WHEN it runs.
+
+  If instead you want the deep stage-by-stage algorithm details (tracker
+  math, OCR steps, voting thresholds, JSON schemas), read the companion
+  file:  complate_workflow.txt
+
+  --------------------------------------------------------------------------
+  THE ONE IDEA TO REMEMBER
+  --------------------------------------------------------------------------
+  The pipeline turns 4 raw train videos (RIGHT_UP, LEFT_UP, RIGHT_UP_TOP,
+  LEFT_UP_TOP) into inspection reports (PDF + JSON) that are uploaded to S3
+  and emailed.
+
+  Everything is built around ONE source of truth:
+
+        GlobalTrainState  = how many wagons, their order, their GW_n ids,
+                            their time boundaries, and whether each is an
+                            ENGINE / WAGON / BRAKE_VAN.
+
+  Only the FIRST stage (the wagon_count/ subpackage) is allowed to create
+  that. RIGHT_UP is the "master" camera. Every later step just READS the
+  GlobalTrainState and adds detail (doors, damage, load, wagon numbers) --
+  nothing recounts or re-numbers the wagons.
+
+  --------------------------------------------------------------------------
+  THE PIPELINE IN 7 STEPS (and which folder owns each)
+  --------------------------------------------------------------------------
+   Stage 0  Get the 4 videos for one train ............ orchestrator/
+   Stage 1  Count wagons -> GlobalTrainState .......... reconstruction/ + wagon_count/
+   Stage 2  Cut videos into per-wagon JPEG frames ..... materializer/
+   Stage 3  Look at each wagon (doors/OCR/load/damage)  features/
+   Stage 4  Merge the 4 feature answers per wagon ..... fusion/
+   Stage 4b Draw overlay videos (visual only) ......... rendering/
+   Stage 5  Build the PDF + JSON reports .............. reporting/
+   Stage 6  Upload to S3 + send one email ............. delivery/
+   (support code used by all stages) ................. core/
+   (the trained model weights) ....................... models/
+
+
+================================================================================
+  FOLDER-BY-FOLDER
+================================================================================
+
+--------------------------------------------------------------------------------
+orchestrator/     "THE CONDUCTOR" -- starts everything, runs the stages in order
+--------------------------------------------------------------------------------
+  This is where you RUN the program from. It decides which train batch to
+  process, calls stages 1->6 in order, and (in --auto mode) handles cameras
+  that arrive at different times.
+
+  master_runner.py       * THE ENTRY POINT. Run it with:
+                             python -m orchestrator.master_runner --local-only ...
+                         Parses CLI flags (--auto / --once / --batch /
+                         --local-only, feature enable/disable, etc.), acquires
+                         one train batch, then calls Stage 1 -> Stage 6 for it.
+                         All run-mode flags are documented in README.md.
+
+  train_batch_manager.py Stage-0 for --auto mode. Talks to S3: lists source
+                         videos, groups them into per-train batches by the
+                         timestamp in the filename, decides which batch is
+                         ready to run, and remembers which batches are already
+                         done (so a restart never reprocesses one). Contains
+                         NO detection logic -- just "which videos form a train".
+
+  batch_manifest.py      The saved, resumable "state file" for one batch
+                         (manifest.json, also mirrored to S3). Lets the service
+                         crash / restart and pick up exactly where it left off.
+                         Written atomically; a newer/unknown format is refused
+                         rather than misread.
+
+  lifecycle_runner.py    The state machine that drives ONE batch through its
+                         lifecycle: wait-for-master -> seal GlobalTrainState ->
+                         process available cameras -> attach late cameras ->
+                         finalize. Each step is guarded so a restart or a
+                         duplicate poll repeats no work. Handles the real-world
+                         case where the 4 camera videos do NOT arrive together.
+
+  feature_markers.py     Tiny "done" receipts, one per (camera, feature), at
+                         wagon_states/.features/<CAMERA>/<feature>.json. They
+                         record the exact inputs used (video ETag + model hash +
+                         thresholds), so a feature is re-run ONLY when something
+                         actually changed. This is what makes restarts cheap.
+
+--------------------------------------------------------------------------------
+reconstruction/   STAGE 1 driver -- "count the wagons"
+--------------------------------------------------------------------------------
+  runner.py              Thin wrapper that runs the wagon_count/ subpackage as a
+                         subprocess (with --no-frames, because the materializer
+                         owns frame extraction). It gets back
+                         global_train_state.json + per_camera_tracking.json and
+                         loads them into memory. If this stage fails or finds 0
+                         wagons, the whole batch aborts (there is nothing to
+                         report). Also keeps wagon_count's debug overlay mp4s.
+
+--------------------------------------------------------------------------------
+wagon_count/      THE STAGE-1 BRAIN (a self-contained sub-project)
+--------------------------------------------------------------------------------
+  This is the "Phase-1" engine copied in as its own package. It is the ONLY
+  place gaps between wagons are detected and wagons are counted/numbered.
+
+  run_global_count.py    Standalone CLI entry point for the counting engine
+                         (this is what reconstruction/runner.py calls). Loads the
+                         gap models, runs per-camera tracking, fuses cameras, and
+                         writes global_train_state.json.
+  tracker_engine.py      Per-camera work: run the gap-detection YOLO on every
+                         frame, track each gap over time with a Kalman filter +
+                         hit/miss persistence, and (RIGHT_UP only) classify each
+                         segment as ENGINE / WAGON / BRAKE_VAN by voting.
+  global_alignment.py    Cross-camera gap FUSION: line up the support cameras'
+                         gaps against the RIGHT_UP master timeline, recover gaps
+                         the master missed (if enough support cameras agree), and
+                         emit the final GW_1..GW_N wagons.
+  global_train_state.py  The data definitions (GapEvent, GlobalWagon,
+                         GlobalTrainState, etc.) -- the "shape" of the answer.
+  video_segmenter.py     Draws the Stage-1 DEBUG overlay videos (cyan gap boxes,
+                         magenta wagon-boundary lines, current wagon id). Also
+                         can extract frames, but in v4 that job is disabled here.
+  global_train_state.py / global_alignment.py / tracker_engine.py together are
+  the full counting intelligence.
+  inputs/README.md, models/README.md   where to drop videos/weights if you run
+                         wagon_count standalone (not needed in the v4 flow).
+  RUN_WAGON_COUNT.ipynb, PIPELINE_WORKFLOW_WAGON_COUNT.txt, README.md,
+  requirements.txt       standalone docs/notebook for using wagon_count alone.
+
+--------------------------------------------------------------------------------
+materializer/     STAGE 2 -- "cut the videos into per-wagon pictures"
+--------------------------------------------------------------------------------
+  wagon_cache_builder.py Opens each of the 4 videos ONCE and saves its frames as
+                         JPEGs, sorted into a folder per wagon per camera:
+                             wagon_cache/GW_7/right_up/frame_000123.jpg ...
+                         This is the LAST place in the whole pipeline that
+                         decodes video for analysis. Everything after this reads
+                         JPEGs from disk -- never the video again.
+
+--------------------------------------------------------------------------------
+features/         STAGE 3 -- "inspect each wagon" (the heavy AI work)
+--------------------------------------------------------------------------------
+  Four independent inspectors run in parallel, each reading the cached JPEGs and
+  writing one JSON answer per wagon. Each processor is a THIN driver; the real
+  cleverness lives in inference_lib/.
+
+  door/processor.py      Are the left/right doors OPEN / CLOSED / PARTIAL /
+                         DAMAGED?  Uses door_state.pt on the side cameras.
+  ocr/processor.py       Read the 11-digit wagon NUMBER (RIGHT_UP only).
+                         Uses wagon_id_counting.pt to find the number plate +
+                         easyocr to read the digits.
+  load/processor.py      Is the wagon LOADED or EMPTY?  Uses loaded.pt on the
+                         top cameras (RIGHT_UP_TOP is authoritative).
+  damage/processor.py    Is there roof/floor DAMAGE?  Uses damage.pt on the top
+                         cameras. Also skips "floor damage" on loaded wagons
+                         (the floor is hidden under cargo).
+
+  _common.py             Shared low-level helpers every processor uses: a cached
+                         YOLO loader (load a model once, reuse it), a frame
+                         iterator over the cached JPEGs, thin detect/classify
+                         calls, voting helpers, and the standard per-wagon JSON
+                         writer. Keeps each processor small.
+  _evidence.py           Saves the "best frame" proof images per wagon under
+                         evidence/GW_n/<feature>/ (e.g. the clearest shot of an
+                         open door, plus a cropped close-up + metadata.json).
+                         These snapshots are what the reports and overlay videos
+                         later display.
+
+  inference_lib/         * THE MATURE, REUSED "LEGACY INTELLIGENCE" *
+                         The battle-tested detection/tracking code shared by the
+                         processors. This is the accuracy of the old system,
+                         reused unchanged:
+    door_tracker.py            Track doors across frames (Kalman + Hungarian
+                               matching) and decide the final state with a
+                               state machine + confidence voting.
+    door_identity_merger.py    Merge track fragments that are really the SAME
+                               physical door.
+    damage_tracker.py          Same idea as door_tracker but for damage regions.
+    illumination_processor.py  Score how good the lighting is in a frame (glare /
+                               shadow / brightness) and enhance it; used to
+                               weight votes toward clearer frames.
+    geometric_shape_prior.py   Sanity-check a detected box's shape (aspect ratio,
+                               vertical edges, borders) to drop false positives.
+    snapshot_selector.py       Multi-metric "best frame" scoring helper.
+    wagon_number_ocr.py        The full OCR pipeline: clean up the number-plate
+                               crop (upscale, denoise, CLAHE, sharpen) and read
+                               digits, with railway-number validation + digit
+                               confusion-fixups.
+    temporal_reasoning.py      Time-based consistency helpers for tracking.
+    wagon_number_aggregator.py Combine the wagon-number readings from many frames
+                               into ONE trusted number (exact-string + per-digit
+                               voting).
+
+--------------------------------------------------------------------------------
+fusion/           STAGE 4 -- "combine the 4 answers into one per wagon"
+--------------------------------------------------------------------------------
+  wagon_state_builder.py Merges the door/ocr/load/damage JSONs for each wagon
+                         into ONE UnifiedWagonState using fixed authority rules
+                         (e.g. right_door comes from RIGHT_UP, load from
+                         RIGHT_UP_TOP, wagon number from RIGHT_UP OCR only). Also
+                         sets the anomaly flags (DOOR_OPEN, TOP_DAMAGE,
+                         OCR_MISSING, ...) that later highlight report rows.
+                         Writes wagon_states/unified/GW_n.json.
+
+--------------------------------------------------------------------------------
+rendering/        STAGE 4b -- "draw the overlay videos" (VISUAL ONLY)
+--------------------------------------------------------------------------------
+  feature_overlay_renderer.py
+                         Re-opens the raw videos ONLY to paint overlays on them:
+                         wagon ids, gap banners, door/damage/OCR boxes on the
+                         best frames, anomaly banners. IMPORTANT: it runs NO AI
+                         model -- it only re-draws things already decided and
+                         saved in Stage 1-4. Produces one processed_*.mp4 per
+                         camera (these are the "PROCESSED VIDEO" links in the
+                         report).
+
+--------------------------------------------------------------------------------
+reporting/        STAGE 5 -- "build the PDF + JSON reports"
+--------------------------------------------------------------------------------
+  camera_reports.py      Stage 5a: builds 4 CAMERA-WISE PDFs, one per camera,
+                         each showing ONLY what that camera is responsible for
+                         (RIGHT_UP: right door + OCR + class; LEFT_UP: left door;
+                         RIGHT_UP_TOP: load + top damage; LEFT_UP_TOP: top-damage
+                         support). Uses snapshots from that camera only.
+  combined_train_report.py
+                         Stage 5b: builds the MAIN combined report (PDF + JSON,
+                         schema v4). Aggregates the 4 camera reports into one
+                         train view with the legacy WagonEye look: title banner,
+                         KPI summary, the big per-wagon table (issue rows
+                         highlighted), links to the 4 camera reports, and a
+                         "Damaged Wagon Report" evidence grid.
+
+  The rest are helper modules shared by the two report builders:
+  _brand.py              The visual identity: colour palette, fonts/paragraph
+                         styles, logo/banner widgets, and small helpers that
+                         decide what counts as an anomaly / how to phrase a door
+                         state.
+  _adapter.py            Translates the v4 backend data (GlobalTrainState +
+                         UnifiedWagonState + evidence) into the row/KPI "view
+                         model" the legacy-style report layout expects. No model
+                         loads; pure data reshaping.
+  _evidence_lookup.py    Finds the right cached frames + evidence snapshots for a
+                         wagon (quartile/midpoint frame selection, path helpers).
+  _pages.py              Reusable reportlab page pieces both report builders share
+                         (document setup, bordered image, summary tables, the 2x2
+                         wagon overview page, detail pages).
+  assets/Logo.jpeg       The logo printed on each page.
+
+--------------------------------------------------------------------------------
+delivery/         STAGE 6 -- "ship it": upload + email (exactly once)
+--------------------------------------------------------------------------------
+  s3_upload.py           Uploads the PDF (via a report microservice, falling back
+                         to a direct S3 PUT), the JSON, and the rest of the batch
+                         tree (evidence, processed videos, states) to S3.
+  notification.py        Sends ONE summary email per batch.
+  finalization.py        The "exactly once" guard: writes delivery/
+                         finalization.json recording what was already uploaded /
+                         emailed, so a restart does NOT upload twice or email
+                         twice.
+  dashboard_ingest.py    OPTIONAL, OFF by default. Re-derives the OLD per-camera
+                         dashboard JSON feed from the new v4 reports, so a legacy
+                         dashboard keeps working without changing the new
+                         pipeline. Read-only.
+
+--------------------------------------------------------------------------------
+core/             SHARED SUPPORT CODE used by every stage (no AI here)
+--------------------------------------------------------------------------------
+  constants.py           Fixed names/values: the 4 camera ids, class labels
+                         (ENGINE/WAGON/BRAKE_VAN), status sentinels, S3 defaults.
+                         All overridable via WAGONEYE_* environment variables.
+  config.py              Central configuration: every filesystem path and runtime
+                         knob (workspace, model dirs, log dir, device, S3, API
+                         URLs). Auto-detects the project root so it runs anywhere;
+                         defaults reproduce the original behaviour.
+  feature_config.py      The registry of Stage-3 features and the enable/disable
+                         logic (CLI flags / interactive prompt). Add a feature
+                         here and it automatically shows up everywhere.
+  camera_features.py     The fixed "which camera drives which feature" map (e.g.
+                         RIGHT_UP_TOP -> load + damage). Ensures a late camera
+                         triggers ONLY its own work, and that load is finalized
+                         before damage (needed for the floor-damage filter).
+  batch.py               The CameraVideo / TrainBatch records: the in-memory
+                         description of one train's 4 videos.
+  global_state_loader.py Loads global_train_state.json into a lightweight
+                         in-memory object (GlobalWagon / GlobalTrainState) that
+                         every later stage reads.
+  unified_wagon_state.py Defines the UnifiedWagonState dataclass -- the final
+                         fully-fused record for one wagon that reporting consumes.
+  lifecycle.py           The vocabularies (state names) for the incremental
+                         lifecycle: batch LifecycleState, per-camera ArrivalState,
+                         and per-result ResultState. Keeps "camera not arrived
+                         yet" distinct from "produced no data".
+  frame_quality.py       Evidence-frame quality scoring (how good is this snapshot
+                         to show in the report). A faithful port of the legacy
+                         snapshot-picking heuristic.
+  logging_setup.py       Configures logging once: a rotating log file
+                         (logs/wagon_eye.log) plus stdout, with per-stage timing
+                         lines. Used everywhere via get_logger(...).
+
+--------------------------------------------------------------------------------
+models/           THE TRAINED AI WEIGHTS (.pt files) -- one central place
+--------------------------------------------------------------------------------
+  reconstruction/        Stage-1 gap/classification models:
+                            right_up_gap.pt, left_up_gap.pt, top_gap.pt,
+                            side_classification.pt
+  features/              Stage-3 feature models:
+                            door_state.pt, loaded.pt, damage.pt,
+                            wagon_id_counting.pt
+  README.md files        say exactly which weight file goes where.
+  (There is NO per-camera duplication of models -- one tree, shared by all.)
+
+--------------------------------------------------------------------------------
+deploy/ + scripts/     RUNNING IT ON A SERVER (EC2)
+--------------------------------------------------------------------------------
+  scripts/setup_ec2.sh          One-shot setup script for a fresh EC2 box.
+  deploy/wagon-eye.service      systemd service file (run as a background
+                                service, auto-restart on reboot).
+  deploy/wagon-eye.env.example  example environment file (WAGONEYE_* settings).
+
+--------------------------------------------------------------------------------
+tests/            AUTOMATED TESTS (proof the tricky parts behave)
+--------------------------------------------------------------------------------
+  test_camera_isolation.py      a late camera never overwrites another's results.
+  test_dashboard_ingest.py      the optional legacy-dashboard adapter.
+  test_delivery_finalization.py the exactly-once upload/email guard.
+  test_fusion_reports.py        fusion authority rules + report building.
+  test_incremental_lifecycle.py the resumable seal/process/finalize state machine.
+
+--------------------------------------------------------------------------------
+logs/             RUNTIME OUTPUT
+--------------------------------------------------------------------------------
+  wagon_eye.log                 the rotating log file the service writes to.
+
+--------------------------------------------------------------------------------
+TOP-LEVEL FILES
+--------------------------------------------------------------------------------
+  README.md               Human overview: quick start, config table, run flags,
+                          failure handling, the incremental-lifecycle design.
+  DEPLOYMENT.md           Full EC2 production install/runbook.
+  requirements.txt        Python dependencies.
+  complate_workflow.txt   The DEEP stage-by-stage algorithm reference
+                          (tracker math, OCR steps, thresholds, JSON schemas).
+  function_workflow.txt   THIS FILE -- the folder/file "what does what" map.
+
+
+================================================================================
+  WHERE THE OUTPUT LANDS (per batch, under batch_outputs/<batch_key>/)
+================================================================================
+  downloads/            the 4 raw videos
+  global_state/         global_train_state.json (the wagon count) + tracking json
+                        + Stage-1 debug overlay mp4s
+  wagon_cache/          Stage-2 per-wagon per-camera JPEG frames
+  wagon_states/         Stage-3 per-feature JSON answers + Stage-4 unified/ JSON
+  evidence/             per-wagon best-frame proof snapshots
+  processed_videos/     Stage-4b rich overlay videos (one per camera)
+  reports/              the 4 camera PDFs + combined_train_report.pdf/.json
+  manifest.json         the resumable lifecycle state
+  delivery/             finalization.json (exactly-once upload/email marker)
+
+
+================================================================================
+  SUGGESTED READING ORDER TO LEARN THE CODE
+================================================================================
+  1. README.md                              -- the big picture + how to run it
+  2. this file (function_workflow.txt)       -- what each folder/file is for
+  3. orchestrator/master_runner.py           -- follow the stages being called
+  4. core/global_state_loader.py +
+     core/unified_wagon_state.py             -- the two key data shapes
+  5. one feature end to end:
+       features/door/processor.py
+       -> features/inference_lib/door_tracker.py
+  6. fusion/wagon_state_builder.py           -- how the answers combine
+  7. reporting/combined_train_report.py      -- how the final report is built
+  8. complate_workflow.txt                   -- the deep algorithm details
+================================================================================

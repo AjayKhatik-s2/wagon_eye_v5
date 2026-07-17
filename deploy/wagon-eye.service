@@ -1,0 +1,55 @@
+# systemd unit for the WagonEye v4 continuous pipeline (--auto S3 polling).
+#
+# INSTALL:
+#   1. Edit the three placeholders below marked  <<EDIT>>  :
+#        User            the Linux user that owns the checkout + venv
+#        WorkingDirectory the absolute path to the cloned repo
+#        (paths in ExecStart / EnvironmentFile / StandardOutput follow it)
+#   2. sudo cp deploy/wagon-eye.service /etc/systemd/system/wagon-eye.service
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable --now wagon-eye
+#   5. journalctl -u wagon-eye -f          # or: tail -f <repo>/logs/wagon_eye.log
+#
+# Graceful shutdown: `systemctl stop wagon-eye` sends SIGTERM, which the
+# orchestrator traps and finishes the CURRENT batch before exiting.  Raise
+# TimeoutStopSec below to exceed your longest expected batch duration, or
+# systemd will SIGKILL a still-running batch when the timer expires.
+
+[Unit]
+Description=WagonEye v4 train-inspection pipeline (continuous S3 polling)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# <<EDIT>> the user and the absolute repo path:
+User=ubuntu
+WorkingDirectory=/opt/wagon_eye_v4
+
+# Environment overrides (bucket, region, device, log dir, ...).
+# Copy deploy/wagon-eye.env.example -> deploy/wagon-eye.env and edit it.
+EnvironmentFile=-/opt/wagon_eye_v4/deploy/wagon-eye.env
+
+# Run the orchestrator from the venv created by scripts/setup_ec2.sh.
+ExecStart=/opt/wagon_eye_v4/.venv/bin/python -m orchestrator.master_runner --auto --no-interactive
+
+# The app writes its own rotating log at <LOG_DIR>/wagon_eye.log; these capture
+# anything printed by deep modules / third-party libs as a belt-and-braces copy.
+StandardOutput=append:/opt/wagon_eye_v4/logs/service.out
+StandardError=append:/opt/wagon_eye_v4/logs/service.err
+
+# Restart on crash, but not on a clean (graceful) exit.
+Restart=on-failure
+RestartSec=15
+
+# Graceful stop: SIGTERM -> finish current batch -> exit.  Increase to exceed
+# the longest batch you expect (a Stage-1 timeout alone can be up to 2h).
+KillSignal=SIGTERM
+TimeoutStopSec=1800
+
+# Basic hardening (optional; relax if it interferes with your S3/tmp usage).
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

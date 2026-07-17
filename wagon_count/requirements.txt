@@ -1,0 +1,18 @@
+# Wagon Eye -- Phase 1 standalone wagon counting
+# Tested on Python 3.10+
+#
+# torch / torchvision are pinned to versions known to work with ultralytics
+# 8.x.  If your AWS instance already has a GPU build of torch installed,
+# you can drop the torch / torchvision lines and only install ultralytics
+# + opencv + numpy.
+
+# opencv-python-headless (not the GUI build) -- this subpackage runs headless
+# on EC2 alongside the main pipeline, which also uses the headless build.  The
+# GUI build would pull in unnecessary X11/GTK shared libraries.
+ultralytics>=8.0.0
+opencv-python-headless>=4.7.0
+numpy>=1.23.0
+
+# torch is required by ultralytics.  Pin a working pair if installing fresh:
+torch>=2.0.0
+torchvision>=0.15.0
