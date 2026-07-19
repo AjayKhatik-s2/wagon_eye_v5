@@ -248,11 +248,11 @@ path — `PROJECT_ROOT` is auto-detected from the source tree.
 | `WAGONEYE_LOG_LEVEL`         | `INFO`                        | `DEBUG`/`INFO`/`WARNING`/`ERROR`. |
 | `WAGONEYE_DEVICE`            | auto (CUDA if available)      | Force `cuda` / `cpu`. |
 | `WAGONEYE_S3_REGION`         | `ap-south-1`                  | AWS region. |
-| `WAGONEYE_S3_OUTPUT_BUCKET`  | `biro-wagon-report-biro-copy` | Output/archive bucket. |
+| `WAGONEYE_S3_OUTPUT_BUCKET`  | `end-results` | Output/archive bucket. |
 | `WAGONEYE_S3_INPUT_BUCKET`   | = output bucket               | Source-video bucket (`--auto`). |
 | `WAGONEYE_S3_INPUT_PREFIXES` | *(empty)*                     | Comma-sep prefixes to poll (`--auto`). |
 | `WAGONEYE_S3_TRAIN_BATCH_PREFIX` | `train_batch`             | S3 key prefix for outputs. |
-| `WAGONEYE_S3_STATE_KEY`      | `master_runner/processed_batches.json` | Processed-batch state file. |
+| `WAGONEYE_S3_STATE_KEY`      | `processed_batches.json` | Processed-batch state file. |
 | `WAGONEYE_UPLOAD_API_URL`    | *(prod URL)*                  | PDF microservice endpoint. |
 | `WAGONEYE_EMAIL_API_URL`     | *(prod URL)*                  | Email microservice endpoint. |
 | `WAGONEYE_EMAIL_RECEIVER`    | *(prod list)*                 | Comma-sep TO recipients. |
@@ -406,13 +406,13 @@ cameras only attach door/OCR/load/damage features to the existing wagons.
 RECONSTRUCTING → GLOBAL_STATE_SEALED → PROCESSING_AVAILABLE_CAMERAS →
 WAITING_FOR_LATE_CAMERAS → PROCESSING_LATE_CAMERA → FINALIZING →`
 terminal: `COMPLETED | COMPLETED_PARTIAL | FAILED_NO_GLOBAL_STATE | REPORT_FAILED | FAILED`.
-Only terminal states are written to `master_runner/processed_batches.json`; every
+Only terminal states are written to `processed_batches.json`; every
 non-terminal batch lives on as an active manifest and is revisited each poll.
 
 ### Persistence & markers
 | Artifact | Location | Purpose |
 |---|---|---|
-| Batch manifest | `batch_outputs/<key>/manifest.json` (+ `s3://<out>/train_batch/<key>/manifest.json`) | resumable lifecycle state; schema-versioned, atomic writes |
+| Batch manifest | `batch_outputs/<key>/manifest.json` (+ `s3://<out>/archive/<key>/manifest.json`) | resumable lifecycle state; schema-versioned, atomic writes |
 | Materialization marker | `wagon_cache/.materialized/<CAMERA>.json` | skip re-extraction; keyed on ETag + GST version + materializer schema |
 | Feature marker | `wagon_states/.features/<CAMERA>/<feature>.json` | skip re-inference; keyed on ETag + GST version + model SHA-256 + processor schema + threshold hash |
 | Finalization marker | `delivery/finalization.json` | idempotent one-upload/one-email; records report hashes, upload URLs, email status + idempotency key |

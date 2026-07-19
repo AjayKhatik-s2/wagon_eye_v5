@@ -395,11 +395,11 @@ def process_batch(
 
     # Deterministic S3 URLs for processed videos so Stage 5 can embed them
     # before Stage 6 actually uploads (mirrors `s3_upload.upload_tree`'s key
-    # construction: <S3_TRAIN_BATCH_PREFIX>/<batch_key>/processed_videos/<file>).
+    # construction: <archive_prefix>/<batch_key>/processed_videos/<file>).
     def _processed_video_url(cam: str, local_path: str) -> str:
         if not local_path or skip_upload:
             return local_path or ""
-        key = (f"{C.S3_TRAIN_BATCH_PREFIX}/{batch.batch_key}/"
+        key = (f"{C.S3_ARCHIVE_PREFIX}/{batch.batch_key}/"
                f"processed_videos/{os.path.basename(local_path)}")
         return f"https://{C.S3_OUTPUT_BUCKET}.s3.{C.S3_REGION}.amazonaws.com/{key}"
 

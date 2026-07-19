@@ -65,25 +65,25 @@ ALL_CAMERAS = (RIGHT_UP, LEFT_UP, RIGHT_UP_TOP, LEFT_UP_TOP)
 _CAMERA_CONFIG: Dict[str, Dict[str, object]] = {
     RIGHT_UP: {
         "raw":     "biro-wagon-raw-video-copy/camera_CCTV_HZBN_DHN_2_RIGHT_UP",
-        "trimmed": "biro-wagon-pre-processed-video-copy/camera_CCTV_HZBN_DHN_2_RIGHT_UP",
+        "trimmed": "complete-train/camera_CCTV_HZBN_DHN_2_RIGHT_UP",
         "model":   "side_classification.pt",
         "ignore":  ["second_track"],   # a parallel train is ignored (V4 right_up.yaml)
     },
     LEFT_UP: {
         "raw":     "biro-wagon-raw-video-copy/camera_CCTV_HZBN_DHN_1_LEFT_UP",
-        "trimmed": "biro-wagon-pre-processed-video-copy/camera_CCTV_HZBN_DHN_1_LEFT_UP",
+        "trimmed": "complete-train/camera_CCTV_HZBN_DHN_1_LEFT_UP",
         "model":   "side_classification.pt",
         "ignore":  [],
     },
     RIGHT_UP_TOP: {
         "raw":     "biro-wagon-raw-video-copy/camera_CCTV_HZBN_DHN_5_RIGHT_TOP",
-        "trimmed": "biro-wagon-pre-processed-video-copy/camera_CCTV_HZBN_DHN_5_RIGHT_TOP",
+        "trimmed": "complete-train/camera_CCTV_HZBN_DHN_5_RIGHT_TOP",
         "model":   "top_classification.pt",
         "ignore":  [],
     },
     LEFT_UP_TOP: {
         "raw":     "biro-wagon-raw-video-copy/camera_CCTV_HZBN_DHN_6_LEFT_TOP",
-        "trimmed": "biro-wagon-pre-processed-video-copy/camera_CCTV_HZBN_DHN_6_LEFT_TOP",
+        "trimmed": "complete-train/camera_CCTV_HZBN_DHN_6_LEFT_TOP",
         "model":   "top_classification.pt",
         "ignore":  [],
     },

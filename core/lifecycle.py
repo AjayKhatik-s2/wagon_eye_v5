@@ -17,7 +17,7 @@ arrived yet is NOT the same as a feature that produced no data):
                        final closure.
 
 Only the terminal LifecycleStates are written into
-`master_runner/processed_batches.json`; every non-terminal batch lives on
+`processed_batches.json`; every non-terminal batch lives on
 as an active BatchManifest and is revisited on later polls.
 """
 

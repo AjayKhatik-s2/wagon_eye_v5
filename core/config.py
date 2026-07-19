@@ -202,7 +202,8 @@ UPLOAD_INTERIM_REPORTS   = _env_bool("WAGONEYE_UPLOAD_INTERIM_REPORTS", False)
 EMAIL_INTERIM_REPORTS    = _env_bool("WAGONEYE_EMAIL_INTERIM_REPORTS", False)
 
 # S3 prefix under which per-batch manifests are mirrored.  Empty -> the manifest
-# lives at <S3_TRAIN_BATCH_PREFIX>/<key>/manifest.json (default).
+# lives at <archive_prefix>/<key>/manifest.json (default: archive/<key>/manifest.json
+# in the end-results bucket).
 MANIFEST_S3_PREFIX = _env_str("WAGONEYE_MANIFEST_S3_PREFIX", "")
 
 # Poll cadence for the active-batch scheduler (seconds).
@@ -300,10 +301,14 @@ def startup_summary(*, mode: str) -> str:
         f"  email_interim_reports    : {EMAIL_INTERIM_REPORTS}",
         f"  late_camera_policy       : {LATE_CAMERA_POLICY}",
         f"  poll_interval_s          : {ACTIVE_BATCH_POLL_INTERVAL}",
+        f"  s3_raw_bucket            : {C.S3_RAW_BUCKET}",
+        f"  s3_trimmed_bucket        : {C.S3_TRIMMED_BUCKET}",
         f"  s3_output_bucket         : {C.S3_OUTPUT_BUCKET}",
         f"  s3_input_bucket          : {C.S3_INPUT_BUCKET}",
         f"  s3_input_prefixes        : {len(C.S3_INPUT_PREFIXES)} configured",
-        f"  s3_train_batch_prefix    : {C.S3_TRAIN_BATCH_PREFIX}",
+        f"  s3_output_prefixes       : reports={C.S3_REPORTS_PREFIX} "
+        f"dashboard={C.S3_DASHBOARD_PREFIX} archive={C.S3_ARCHIVE_PREFIX}",
+        f"  s3_state_key             : {C.S3_STATE_KEY}",
         f"  email_recipients         : to={n_to} cc={n_cc} (redacted)",
     ]
     return "\n".join(lines)

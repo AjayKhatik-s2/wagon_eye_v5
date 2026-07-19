@@ -14,7 +14,7 @@ lines in the log; per-feature lines as `[FEAT/<feature>] done in …`.
 
 ## Stage A — Train extraction (raw → trimmed)  *(separate producer service)*
 - **Input:** raw CCTV clips in `s3://biro-wagon-raw-video-copy/<camera_folder>/…` (per camera).
-- **Output:** trimmed `"<raw_basename>_train.mp4"` in `s3://biro-wagon-pre-processed-video-copy/<camera_folder>/`.
+- **Output:** trimmed `"<raw_basename>_train.mp4"` in `s3://complete-train/<camera_folder>/`.
 - **Success:** for a raw clip containing a train pass, ≥1 trimmed clip uploaded; raw key recorded in the local ledger; cross-clip trains stitched.
 - **Failure:** no trimmed clip for a clip that clearly contains a train; repeated re-extraction of an already-processed key (ledger not honoured); extractor exception.
 - **Files:** `logs/extraction_state/processed_<camera>.json` (ledger); the trimmed S3 objects.
@@ -113,7 +113,7 @@ lines in the log; per-feature lines as `[FEAT/<feature>] done in …`.
 
 ## Stage 6b — PDF + JSON upload (S3)
 - **Input:** `reports/combined_train_report.{pdf,json}` (+ camera PDFs).
-- **Output:** `s3://biro-wagon-report-biro-copy/train_batch/$BK/reports/…`; upload URLs recorded.
+- **Output:** `s3://end-results/reports/$BK/…`; upload URLs recorded.
 - **Success:** PDF upload via report microservice (fallback direct S3 PUT) returns a URL; JSON uploaded; URLs in `finalization.json`.
 - **Failure:** both microservice + direct PUT fail (logged); missing URL.
 - **Files:** `delivery/finalization.json` (`upload_urls`); the S3 objects.
@@ -131,7 +131,7 @@ lines in the log; per-feature lines as `[FEAT/<feature>] done in …`.
 
 ## Stage 6d — Archive + cleanup + auto-completion
 - **Input:** finalized batch.
-- **Output:** batch tree archived to S3 (evidence + processed_videos + states + reports); terminal status in `master_runner/processed_batches.json`; manifest terminal; temp dirs removed.
+- **Output:** batch tree archived to S3 (evidence + processed_videos + states + reports); terminal status in `processed_batches.json`; manifest terminal; temp dirs removed.
 - **Success:** terminal status ∈ {`completed`,`completed_partial`,`report_failed`,`failed_no_global_state`,`failed`}; exactly-once upload+email; next train starts clean (no duplicate work on re-poll).
 - **Failure:** batch stuck non-terminal; duplicate processing on re-poll; temp dirs not cleaned.
 - **Files:** `processed_batches.json`; `$B/manifest.json` (terminal); `$B/archive/`.

@@ -166,7 +166,7 @@ Raw Cameras
     │  (external uploader writes clips)
     ▼
 Raw S3 Bucket  ──────────────►  Extraction Service  ──────────►  Trimmed S3 Bucket
- biro-wagon-raw-video-copy     (train_extraction)              biro-wagon-pre-processed-video-copy
+ biro-wagon-raw-video-copy     (train_extraction)              complete-train
                                                                      │
                                                                      ▼
                                                               Inspection Service
@@ -194,7 +194,7 @@ Raw S3 Bucket  ──────────────►  Extraction Service
   when a clip contains a train pass, trims exactly the train portion (stitching
   across clip boundaries when a train spans two raw clips), and uploads the
   trimmed clip. It performs **no inspection**.
-- **Trimmed S3 bucket** (`biro-wagon-pre-processed-video-copy`). Holds
+- **Trimmed S3 bucket** (`complete-train`). Holds
   `"<raw>_train.mp4"` clips. It is the boundary between the two services and the
   inspection service's only input.
 - **Inspection service** (`orchestrator.master_runner --auto`). Watches the
@@ -521,7 +521,7 @@ They are **semantically distinct** and must not be conflated:
 | Materialization marker | `wagon_cache/.materialized/<CAMERA>.json` | skip re-extraction; keyed on ETag + GST version + materializer schema |
 | Feature marker | `wagon_states/.features/<CAMERA>/<feature>.json` | skip re-inference; keyed on ETag + GST version + **production model SHA-256** + processor schema + threshold hash |
 | Finalization marker | `delivery/finalization.json` | exactly-once upload/email/ingest; records report hashes, URLs, email status, idempotency key |
-| Processed batches | `master_runner/processed_batches.json` (S3) | terminal batch keys; never reprocessed |
+| Processed batches | `processed_batches.json` (S3) | terminal batch keys; never reprocessed |
 
 ### 4.5 Camera events
 - **Arrival.** A clip whose timestamp joins this batch's cluster → the camera is
@@ -542,7 +542,7 @@ They are **semantically distinct** and must not be conflated:
   no completed reconstruction, materialization, feature inference, upload, or
   email.
 - **Archive.** On finalize, the batch tree (evidence + processed videos + states +
-  reports) is uploaded to S3 under `train_batch/<key>/`; the batch is recorded
+  reports) is uploaded to S3 under `archive/<key>/`; the batch is recorded
   terminal.
 - **Deletion.** Local `batch_outputs/<key>/` may be pruned after archive; the S3
   archive + terminal record are the durable truth. Only terminal batches are safe
@@ -967,8 +967,8 @@ prevents re-doing the successful ones).
 - Models: `models/reconstruction` (Stage 1 + loco region), `models/production`
   (Stage 3), `models/extraction` (Stage A); staged from `s3://wagon-eye-models`.
 - Buckets: raw `biro-wagon-raw-video-copy`, trimmed
-  `biro-wagon-pre-processed-video-copy`, output/archive
-  `biro-wagon-report-biro-copy`.
+  `complete-train`, output/archive
+  `end-results`.
 - Cameras: the four canonical ids (`RIGHT_UP` master, `LEFT_UP`, `RIGHT_UP_TOP`,
   `LEFT_UP_TOP`); lowercase cache folder names; a filename must contain the camera
   substring + a `YYYYMMDD_HHMMSS` stamp.
@@ -1005,7 +1005,7 @@ missing model does not crash startup — the owning feature emits `NO_DATA`.
 ### 12.4 Health checks & monitoring
 Liveness = the service process is up (systemd) and the log shows recent poll
 lines. Progress = new terminal entries in `processed_batches.json` and new
-`train_batch/<key>/` trees in S3. Per-stage `STAGE …` and `[FEAT/…] done in …`
+`archive/<key>/` trees in S3. Per-stage `STAGE …` and `[FEAT/…] done in …`
 log lines give timing; batch outcomes give success/failure. Alerting is on
 service-down, on batches stuck non-terminal past the final deadline, and on
 repeated delivery failures.
@@ -1150,7 +1150,7 @@ maintained.
    `RIGHT_UP_TOP`, `LEFT_UP_TOP`; the authority map in §8.2.
 2. **S3 naming.** Raw `raw-bucket/<camera_folder>/…`; trimmed
    `trimmed-bucket/<camera_folder>/<raw>_train.mp4` (timestamp in name); output
-   `output-bucket/train_batch/<key>/…`; state `master_runner/processed_batches.json`.
+   `output-bucket/archive/<key>/…`; state `processed_batches.json`.
 3. **GlobalTrainState JSON schema** (§5.3): `total_wagons`, `wagons[]` with
    `global_id`/`wagon_index`/`start_time`/`end_time`/`classification` + master
    clock fields + correction provenance. `GW_n` is the immutable join key.

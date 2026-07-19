@@ -72,7 +72,7 @@ Set the inspection side to poll the **trimmed** bucket/prefixes this producer
 writes to (in `deploy/wagon-eye.env`):
 
 ```bash
-WAGONEYE_S3_INPUT_BUCKET=biro-wagon-pre-processed-video-copy
+WAGONEYE_S3_INPUT_BUCKET=complete-train
 WAGONEYE_S3_INPUT_PREFIXES=camera_CCTV_HZBN_DHN_2_RIGHT_UP/,camera_CCTV_HZBN_DHN_1_LEFT_UP/,camera_CCTV_HZBN_DHN_5_RIGHT_TOP/,camera_CCTV_HZBN_DHN_6_LEFT_TOP/
 ```
 

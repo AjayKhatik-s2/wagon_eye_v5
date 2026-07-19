@@ -154,23 +154,57 @@ DAMAGE_CLASSES_NEGATIVE = {"no_damage"}
 
 
 # -----------------------------------------------------------------------------
-# S3 + email -- preserved from the legacy master_runner constants so the
-# new package can drop in without operational changes.  Each value is now
-# overridable via a WAGONEYE_* environment variable (same default) so a
-# staging / alternate-bucket EC2 deployment needs no source edit.
+# S3 storage architecture (2026 migration).  Every value is overridable via a
+# WAGONEYE_* environment variable.  Three buckets, strictly separated:
+#
+#   RAW      biro-wagon-raw-video-copy   raw camera recordings only (extraction IN)
+#   TRIMMED  complete-train              trimmed complete-train clips
+#                                        (extraction OUT == inspection IN);
+#                                        laid out per camera folder.
+#   OUTPUT   end-results                 ALL inspection outputs, under three
+#                                        purpose prefixes + the processed-batches
+#                                        state file:
+#                                          reports/<batch_key>/...
+#                                          dashboard/<camera_folder>/<date>/...
+#                                          archive/<batch_key>/...   (batch tree,
+#                                            manifest, evidence, processed_videos,
+#                                            global_state, wagon_states, metadata)
+#                                          processed_batches.json    (duplicate guard)
+#
+# master_runner --auto reads ONLY the TRIMMED bucket; it never reads RAW.
 # -----------------------------------------------------------------------------
 
 S3_REGION = _env("WAGONEYE_S3_REGION", "ap-south-1")
-S3_OUTPUT_BUCKET = _env("WAGONEYE_S3_OUTPUT_BUCKET", "biro-wagon-report-biro-copy")
-S3_TRAIN_BATCH_PREFIX = _env("WAGONEYE_S3_TRAIN_BATCH_PREFIX", "train_batch")
-S3_STATE_KEY = _env("WAGONEYE_S3_STATE_KEY", "master_runner/processed_batches.json")
 
-# Comma-separated list of S3 input prefixes the poller scans for source
-# videos (one per camera rig, or a single shared prefix).  Empty default
-# preserves the pre-migration behaviour where the (external) batch manager
-# owned this; the in-package train_batch_manager reads it when set.
-S3_INPUT_PREFIXES = _env_list("WAGONEYE_S3_INPUT_PREFIXES", [])
-S3_INPUT_BUCKET = _env("WAGONEYE_S3_INPUT_BUCKET", S3_OUTPUT_BUCKET)
+# --- buckets ---
+S3_RAW_BUCKET     = _env("WAGONEYE_S3_RAW_BUCKET", "biro-wagon-raw-video-copy")
+S3_TRIMMED_BUCKET = _env("WAGONEYE_S3_TRIMMED_BUCKET", "complete-train")
+S3_OUTPUT_BUCKET  = _env("WAGONEYE_S3_OUTPUT_BUCKET", "end-results")
+
+# Inspection input == the trimmed bucket (master_runner --auto polls THIS, never RAW).
+S3_INPUT_BUCKET = _env("WAGONEYE_S3_INPUT_BUCKET", S3_TRIMMED_BUCKET)
+# Comma-separated camera folders under the trimmed bucket the poller scans.
+S3_INPUT_PREFIXES = _env_list("WAGONEYE_S3_INPUT_PREFIXES", [
+    "camera_CCTV_HZBN_DHN_1_LEFT_UP/",
+    "camera_CCTV_HZBN_DHN_2_RIGHT_UP/",
+    "camera_CCTV_HZBN_DHN_5_RIGHT_TOP/",
+    "camera_CCTV_HZBN_DHN_6_LEFT_TOP/",
+])
+
+# --- output-bucket purpose prefixes (under S3_OUTPUT_BUCKET = end-results) ---
+S3_REPORTS_PREFIX   = _env("WAGONEYE_S3_REPORTS_PREFIX", "reports")
+S3_DASHBOARD_PREFIX = _env("WAGONEYE_S3_DASHBOARD_PREFIX", "dashboard")
+S3_ARCHIVE_PREFIX   = _env("WAGONEYE_S3_ARCHIVE_PREFIX", "archive")
+
+# Processed-batches state file (duplicate-processing guard), at the output-bucket
+# root so it lives alongside reports/ dashboard/ archive/.
+S3_STATE_KEY = _env("WAGONEYE_S3_STATE_KEY", "processed_batches.json")
+
+# DEPRECATED (pre-migration single-prefix layout `train_batch/<key>/...`).
+# Retained only so an env override that still sets it does not error; NO code
+# path uses it after the migration -- reports/dashboard/archive prefixes replace
+# it. Remove once no deployment references WAGONEYE_S3_TRAIN_BATCH_PREFIX.
+S3_TRAIN_BATCH_PREFIX = _env("WAGONEYE_S3_TRAIN_BATCH_PREFIX", "train_batch")
 
 UPLOAD_API_URL = _env("WAGONEYE_UPLOAD_API_URL",
                       "https://reports-api.suvidhaen.com/api/upload-pdf")

@@ -161,7 +161,7 @@ wagon_eye_v4_new/
 |---|---|---|
 | Pull models | `s3:GetObject`, `s3:ListBucket` | `s3://wagon-eye-models/*` |
 | (Auto mode only) discover source videos | `s3:GetObject`, `s3:ListBucket` | input bucket/prefixes |
-| (Auto mode only) upload reports/state | `s3:PutObject`, `s3:GetObject`, `s3:ListBucket` | `s3://biro-wagon-report-biro-copy/*` |
+| (Auto mode only) upload reports/state | `s3:PutObject`, `s3:GetObject`, `s3:ListBucket` | `s3://end-results/*` |
 
 For **local Door validation** (`--local-only`, `--skip-upload`, `--skip-email`)
 only the **model-pull** permission is needed (and even that only for the initial

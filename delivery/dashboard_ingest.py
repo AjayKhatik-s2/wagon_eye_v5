@@ -50,7 +50,7 @@ The degraded set for each payload is echoed under ``inspection_data._adapter`` s
 a consumer can see exactly what was and was not faithfully reproduced.
 
 NOTE: this posts to the LIVE dashboard on every run.  Confirm with the dashboard
-team that (a) reused ``train_batch/.../evidence/...`` HTTPS URLs are accepted and
+team that (a) reused ``archive/.../evidence/...`` HTTPS URLs are accepted and
 (b) the degraded loco/direction/gallery fields are acceptable.  Set
 ``WAGONEYE_DASHBOARD_INGEST_ENABLED=false`` to disable without a code change.
 """
@@ -141,7 +141,10 @@ def is_enabled() -> bool:
 
 
 def _inspection_bucket() -> str:
-    return _env("WAGONEYE_INSPECTION_JSON_BUCKET", "ankit-version-1-prod")
+    # 2026 migration: dashboard payloads live in the end-results bucket under the
+    # dashboard/ prefix. Override with WAGONEYE_INSPECTION_JSON_BUCKET only if a
+    # separate dashboard bucket is still required (back-compat).
+    return _env("WAGONEYE_INSPECTION_JSON_BUCKET", C.S3_OUTPUT_BUCKET)
 
 
 def _ingest_api_url() -> str:
@@ -215,8 +218,8 @@ def date_folder(dt: Optional[datetime]) -> str:
 def evidence_url(output_bucket: str, region: str, batch_key: str,
                  gw: str, feature: str, camera: str, filename: str) -> str:
     """Deterministic HTTPS URL for an evidence JPEG already mirrored to S3 by the
-    Stage-6 tree upload (``train_batch/<key>/evidence/...``)."""
-    key = (f"{C.S3_TRAIN_BATCH_PREFIX}/{batch_key}/evidence/"
+    Stage-6 archive tree upload (``archive/<key>/evidence/...`` in end-results)."""
+    key = (f"{C.S3_ARCHIVE_PREFIX}/{batch_key}/evidence/"
            f"{gw}/{feature}/{camera}/{filename}")
     return f"https://{output_bucket}.s3.{region}.amazonaws.com/{key}"
 
@@ -286,8 +289,8 @@ class _UrlMaker:
         if self.reuse:
             return evidence_url(self.output_bucket, self.region, self.batch_key,
                                 gw, feature, camera, filename)
-        # copy-only mode: upload just this JPEG to the legacy bucket
-        key = (f"{self.folder}/{self.date_folder}/evidence/"
+        # copy-only mode: upload just this JPEG under the dashboard/ prefix
+        key = (f"{C.S3_DASHBOARD_PREFIX}/{self.folder}/{self.date_folder}/evidence/"
                f"{gw}/{feature}/{camera}/{filename}")
         if self.skip_upload or self.s3 is None:
             return f"https://{self.inspection_bucket}.s3.{self.region}.amazonaws.com/{key}"
@@ -738,7 +741,7 @@ def _run_inner(*, batch_root, s3_client, skip_upload, skip_ingest,
             f.write(text)
 
         folder = folder_for(camera)
-        s3_key = f"{folder}/{df}/{json_name}"
+        s3_key = f"{C.S3_DASHBOARD_PREFIX}/{folder}/{df}/{json_name}"
         s3_uri = f"s3://{inspection_bucket}/{s3_key}"
 
         entry = {

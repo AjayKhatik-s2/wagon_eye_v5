@@ -87,7 +87,7 @@ For **continuous `--auto` mode you must set the input prefixes** so the poller
 knows where the source videos land:
 
 ```ini
-WAGONEYE_S3_INPUT_BUCKET=biro-wagon-report-biro-copy
+WAGONEYE_S3_INPUT_BUCKET=end-results
 WAGONEYE_S3_INPUT_PREFIXES=incoming/right_up/,incoming/left_up/,incoming/right_up_top/,incoming/left_up_top/
 ```
 
@@ -185,7 +185,7 @@ python -m orchestrator.master_runner --batch <key>  # replay a specific batch
 3. Drop a complete set of 4 videos into the input prefix(es); within one poll
    interval (`--poll-interval`, default 60 s) the log shows
    `[BATCH] discovered … batch(es)` → the 6 stage lines → `[BATCH <key>] completed`.
-4. Check the output bucket for `train_batch/<key>/reports/combined_train_report.pdf`
+4. Check the output bucket for `reports/<key>/combined_train_report.pdf`
    and the archived tree; confirm the notification email arrived.
 5. Confirm the device line at startup:
    `WagonEye v4 orchestrator starting (device=cuda)` on a GPU box.
@@ -196,7 +196,7 @@ python -m orchestrator.master_runner --batch <key>  # replay a specific batch
 
 - **After a reboot**, `systemd` restarts the service automatically (because of
   `enable`). Processed-batch state lives in S3
-  (`s3://<bucket>/master_runner/processed_batches.json`), so no batch is
+  (`s3://<bucket>/processed_batches.json`), so no batch is
   reprocessed after a restart.
 - **Disk growth**: each batch leaves its full working tree under
   `batch_outputs/<key>/` (downloads, wagon_cache JPEGs, evidence, processed

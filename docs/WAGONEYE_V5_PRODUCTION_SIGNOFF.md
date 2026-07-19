@@ -17,7 +17,7 @@ verify + the pass bar. Nothing is a code change; this is acceptance only.
 
 ## B. Pipeline execution
 
-- [ ] **Pipeline completes** — `master_runner` exits 0; batch reaches a terminal status in `master_runner/processed_batches.json` (`completed` / `completed_partial`); no unhandled exception in `logs/wagon_eye.log`.
+- [ ] **Pipeline completes** — `master_runner` exits 0; batch reaches a terminal status in `processed_batches.json` (`completed` / `completed_partial`); no unhandled exception in `logs/wagon_eye.log`.
 - [ ] **Stage 1 — GlobalTrainState** — `global_train_state.json` `total_wagons > 0`, `master_camera=RIGHT_UP`; classification distribution sane (engine/wagon/brake_van).
 - [ ] **Stage 2 — materialization** — `wagon_cache/` populated for all present cameras; on-disk JPEG count == `total_frames`; JPEG quality q95.
 - [ ] **Stage 3 — features produce results** (with models present, not `NO_DATA`):
@@ -33,7 +33,7 @@ verify + the pass bar. Nothing is a code change; this is acceptance only.
 - [ ] **inspection_data validated** — per-camera dashboard payload (`delivery/dashboard/<CAMERA>_inspection.json`) validated against `WAGONEYE_V5_SCHEMA_PARITY.md`: `version=v2`; RIGHT_UP `loco_number_results` populated; side `damaged_wagons` includes side damage; degraded fields self-declared in `_adapter.degraded_fields`; no fabricated data.
 - [ ] **Dashboard updated** — ingest POST returned success for each camera (idempotent); `finalization.json.dashboard_ingested` recorded. (Or explicitly deferred with the dashboard team's sign-off on the payload.)
 - [ ] **PDF generated** — `combined_train_report.pdf` non-empty, opens, matches the report expectations above; `combined_train_report.json` schema `wagon_eye.combined_report.v4` valid.
-- [ ] **Upload successful** — combined PDF + JSON in `s3://biro-wagon-report-biro-copy/train_batch/$BK/reports/`; URLs recorded in `finalization.json`. (microservice or direct-PUT fallback.)
+- [ ] **Upload successful** — combined PDF + JSON in `s3://end-results/reports/$BK/`; URLs recorded in `finalization.json`. (microservice or direct-PUT fallback.)
 - [ ] **Email successful** — one email per batch, HTTP 200; subject includes wagon count + **loco numbers**; production recipient list; `finalization.json.email_sent` set; no duplicate on a restart.
 - [ ] **Archive successful** — batch tree (evidence + processed_videos + states + reports) archived to S3; batch marked terminal; temp dirs cleaned; a re-poll does **no** duplicate work.
 

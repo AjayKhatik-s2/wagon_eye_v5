@@ -1,11 +1,11 @@
 """Stage 6 -- upload `batch_outputs/<key>/` to S3.
 
-Strategy:
-    * PDF goes to the report microservice first; falls back to S3.
-    * JSON goes directly to S3 with application/json content-type.
-    * Everything else (wagon_cache + wagon_states + global_state) is
-      recursively uploaded under
-        s3://<bucket>/<train_batch_prefix>/<batch_key>/...
+Strategy (end-results bucket, 2026 storage architecture):
+    * PDF/JSON reports go under  reports/<batch_key>/<file>  (microservice first
+      for the PDF, S3 direct fallback).
+    * The batch tree (global_state + wagon_states + evidence + processed_videos +
+      metadata) is recursively uploaded under  archive/<batch_key>/<sub>/...
+    * Dashboard payloads go under  dashboard/...  (see delivery/dashboard_ingest).
 """
 
 from __future__ import annotations
@@ -82,7 +82,7 @@ def upload_pdf(s3_client, pdf_path: str, batch_key: str) -> Optional[str]:
     if url:
         return url
     bucket = C.S3_OUTPUT_BUCKET
-    key = f"{C.S3_TRAIN_BATCH_PREFIX}/{batch_key}/reports/combined_train_report.pdf"
+    key = f"{C.S3_REPORTS_PREFIX}/{batch_key}/{os.path.basename(pdf_path)}"
     try:
         s3_client.upload_file(
             pdf_path, bucket, key,
@@ -98,7 +98,7 @@ def upload_json(s3_client, json_path: str, batch_key: str) -> Optional[str]:
     if not os.path.exists(json_path):
         return None
     bucket = C.S3_OUTPUT_BUCKET
-    key = f"{C.S3_TRAIN_BATCH_PREFIX}/{batch_key}/reports/combined_train_report.json"
+    key = f"{C.S3_REPORTS_PREFIX}/{batch_key}/{os.path.basename(json_path)}"
     try:
         s3_client.upload_file(
             json_path, bucket, key,
@@ -117,15 +117,17 @@ def upload_tree(
     *, sub_prefix: str = "",
     skip_extensions: Optional[set] = None,
 ) -> int:
-    """Recursively upload everything under `local_dir` to
-    s3://<bucket>/<train_batch_prefix>/<batch_key>/<sub_prefix>/...
+    """Recursively upload everything under `local_dir` to the ARCHIVE prefix
+    s3://<output_bucket>/<archive_prefix>/<batch_key>/<sub_prefix>/...
+    (the complete processed-batch tree: global_state, wagon_states, evidence,
+    processed_videos, metadata).
 
     Returns the number of files uploaded.
     """
     if not os.path.isdir(local_dir):
         return 0
     bucket = C.S3_OUTPUT_BUCKET
-    base   = f"{C.S3_TRAIN_BATCH_PREFIX}/{batch_key}"
+    base   = f"{C.S3_ARCHIVE_PREFIX}/{batch_key}"
     if sub_prefix:
         base = f"{base}/{sub_prefix.strip('/')}"
     skip = skip_extensions or set()

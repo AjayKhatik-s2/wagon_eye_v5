@@ -1166,7 +1166,7 @@
                  product_name="CCTV-WagonEye-CombinedReports",
                  folder_name=today (IST).
         fallback S3 direct PUT to
-                 s3://<output_bucket>/train_batch/<key>/reports/...
+                 s3://<output_bucket>/reports/<key>/...
         Called once for combined_train_report.pdf AND once each for the
         4 camera reports (right_up_report.pdf / left_up_report.pdf /
         right_up_top_report.pdf / left_up_top_report.pdf).
@@ -1299,7 +1299,7 @@
 ================================================================================
 
   processed_batches.json at
-      s3://<output_bucket>/master_runner/processed_batches.json
+      s3://<output_bucket>/processed_batches.json
 
   Read on startup (run_auto), updated after each completed batch.
 
@@ -1653,12 +1653,12 @@
   7. REPORT     Stage 5a -> 4 per-camera PDFs; Stage 5b -> combined PDF + JSON.
   8. DELIVER    Stage 6: ONE PDF upload + ONE email (idempotent via
                 delivery/finalization.json); tree archive to S3; mark the
-                batch in master_runner/processed_batches.json.  OPTIONAL:
+                batch in processed_batches.json.  OPTIONAL:
                 legacy-dashboard ingest (on by default; WAGONEYE_DASHBOARD_INGEST_ENABLED=false to skip).
 
   Outputs land under  batch_outputs/<batch_key>/  (downloads, global_state,
   wagon_cache, wagon_states, evidence, processed_videos, reports, delivery,
-  archive) and are mirrored to s3://<output_bucket>/train_batch/<batch_key>/.
+  archive) and are mirrored to s3://<output_bucket>/archive/<batch_key>/.
 
 
 ================================================================================
@@ -1696,7 +1696,7 @@
       #   WAGONEYE_S3_REGION=ap-south-1
       #   WAGONEYE_S3_INPUT_BUCKET=<raw-video bucket>
       #   WAGONEYE_S3_INPUT_PREFIXES=<cam1/>,<cam2/>,<cam3/>,<cam4/>
-      #   WAGONEYE_S3_OUTPUT_BUCKET=biro-wagon-report-biro-copy
+      #   WAGONEYE_S3_OUTPUT_BUCKET=end-results
 
   STEP 5 -- dry run in the foreground (no uploads, no email):
 
@@ -1756,7 +1756,7 @@
 
   OPTIONAL legacy-dashboard ingest (delivery/dashboard_ingest.py)
       WAGONEYE_DASHBOARD_INGEST_ENABLED    default true   <-- master switch (v1)
-      WAGONEYE_INSPECTION_JSON_BUCKET      default ankit-version-1-prod
+      WAGONEYE_INSPECTION_JSON_BUCKET      default = S3_OUTPUT_BUCKET (end-results, dashboard/ prefix)
       WAGONEYE_INSPECTION_INGEST_API_URL   default .../cctv-receiver/inspections/ingest
       WAGONEYE_INSPECTION_VERSION          default v1  (dashboard tab)
       WAGONEYE_INSPECTION_CAMERA_FULL_IDS  JSON map cam -> full CCTV id

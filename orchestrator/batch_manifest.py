@@ -8,12 +8,12 @@ Design guarantees:
   * Atomic local writes (temp file + os.replace) so a crash mid-write never
     corrupts the manifest.
   * Concurrency-safe S3 strategy: each batch's manifest is its OWN S3 object
-    (`train_batch/<key>/manifest.json`) -- a single writer per batch.  There is
+    (`archive/<key>/manifest.json`) -- a single writer per batch.  There is
     NO shared read-modify-write index; active batches are discovered by LISTING
-    the `train_batch/` prefix and skipping terminal manifests.
+    the `archive/` (manifest) prefix and skipping terminal manifests.
 
 Only terminal LifecycleStates get mirrored into
-`master_runner/processed_batches.json` (handled by train_batch_manager); the
+`processed_batches.json` (handled by train_batch_manager); the
 manifest carries every non-terminal batch across polls and restarts.
 """
 
@@ -280,7 +280,10 @@ def load_local(batch_root: str) -> Optional[BatchManifest]:
 # -----------------------------------------------------------------------------
 
 def manifest_s3_key(batch_key: str) -> str:
-    prefix = (CFG.MANIFEST_S3_PREFIX or C.S3_TRAIN_BATCH_PREFIX).strip("/")
+    # Manifest = per-batch metadata; lives under the archive prefix
+    # (archive/<key>/manifest.json in end-results). Override with
+    # WAGONEYE_MANIFEST_S3_PREFIX if a separate manifest prefix is desired.
+    prefix = (CFG.MANIFEST_S3_PREFIX or C.S3_ARCHIVE_PREFIX).strip("/")
     return f"{prefix}/{batch_key}/{MANIFEST_BASENAME}"
 
 
@@ -318,7 +321,7 @@ def list_active_manifests(
     processed_batches: Dict[str, str],
     bucket: Optional[str] = None,
 ) -> List[BatchManifest]:
-    """Discover non-terminal manifests by LISTING the train_batch/ prefix.
+    """Discover non-terminal manifests by LISTING the archive/ (manifest) prefix.
 
     Terminal batches (present in `processed_batches`) are skipped without a
     fetch.  This is the concurrency-safe alternative to a shared active-index
@@ -328,7 +331,7 @@ def list_active_manifests(
     from core.lifecycle import is_terminal
 
     bucket = bucket or C.S3_OUTPUT_BUCKET
-    prefix = f"{C.S3_TRAIN_BATCH_PREFIX}/"
+    prefix = f"{(CFG.MANIFEST_S3_PREFIX or C.S3_ARCHIVE_PREFIX).strip('/')}/"
     out: List[BatchManifest] = []
     token = None
     seen_keys: set = set()
@@ -342,7 +345,7 @@ def list_active_manifests(
             log.error("[MANIFEST] list_objects_v2 failed (prefix=%s): %s", prefix, e)
             break
         for cp in resp.get("CommonPrefixes", []):
-            p = cp.get("Prefix", "")            # train_batch/<key>/
+            p = cp.get("Prefix", "")            # archive/<key>/
             key = p[len(prefix):].strip("/")
             if not key or key in seen_keys:
                 continue

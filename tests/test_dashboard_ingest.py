@@ -166,7 +166,7 @@ def test_date_folder_operational_day_rule():
 def _url_maker(root, camera):
     return DI._UrlMaker(
         s3_client=None, output_bucket=C.S3_OUTPUT_BUCKET, region=C.S3_REGION,
-        inspection_bucket="ankit-version-1-prod", batch_key="20260408_032134",
+        inspection_bucket=C.S3_OUTPUT_BUCKET, batch_key="20260408_032134",
         folder=DI.folder_for(camera), date_folder_str="2026-04-07",
         reuse=True, skip_upload=True)
 
@@ -311,7 +311,7 @@ def test_run_ingests_each_present_camera_then_idempotent(tmp_path, monkeypatch):
     assert all(v["status"] == "ingested" for v in res["cameras"].values())
     assert len(rq.calls) == 3
     # 3 JSON uploads to the inspection bucket
-    assert sum(1 for b, k in s3.uploads if b == "ankit-version-1-prod") == 3
+    assert sum(1 for b, k in s3.uploads if b == C.S3_OUTPUT_BUCKET) == 3
 
     # ---- restart: same artifacts -> no re-upload, no re-POST ----
     rq2 = FakeRequests([])

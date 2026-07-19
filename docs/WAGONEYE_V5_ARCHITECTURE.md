@@ -19,7 +19,7 @@ S3. **Extraction** turns continuous CCTV into trimmed train clips; **inspection*
         upload "<raw>_train.mp4"      (ledger: logs/extraction_state/)
                                                 │
                                                 ▼
-        s3://biro-wagon-pre-processed-video-copy/<camera_folder>/*_train.mp4
+        s3://complete-train/<camera_folder>/*_train.mp4
                                                 │  (WAGONEYE_S3_INPUT_BUCKET/PREFIXES)
    ═══════════ SERVICE 2: orchestrator.master_runner --auto (inspection) ═════════
                                                 │
@@ -62,9 +62,9 @@ S3. **Extraction** turns continuous CCTV into trimmed train clips; **inspection*
    │ STAGE 6  delivery (exactly-once via delivery/finalization.json)             │
    │   ├ dashboard_ingest → delivery/dashboard/<CAMERA>_inspection.json          │
    │   │     POST cctv-receiver/inspections/ingest  (version v2; loco_number_results)│
-   │   ├ s3_upload → s3://biro-wagon-report-biro-copy/train_batch/$BK/reports/…  │
+   │   ├ s3_upload → s3://end-results/reports/$BK/…  │
    │   ├ notification → ONE email (subject incl. loco numbers; prod recipients)  │
-   │   └ archive batch tree + mark terminal in master_runner/processed_batches.json│
+   │   └ archive batch tree + mark terminal in processed_batches.json│
    └───────────────────────────────────┬────────────────────────────────────────┘
                                         ▼
                     WagonEye dashboard  +  ops inbox  (COMPLETE → next train)
@@ -81,8 +81,8 @@ S3. **Extraction** turns continuous CCTV into trimmed train clips; **inspection*
 | Bucket | Role |
 |---|---|
 | `biro-wagon-raw-video-copy` | raw CCTV (extraction input) |
-| `biro-wagon-pre-processed-video-copy` | trimmed clips (extraction output = inspection input) |
-| `biro-wagon-report-biro-copy` | `train_batch/$BK/…` reports/JSON/archive + `master_runner/processed_batches.json` |
+| `complete-train` | trimmed clips (extraction output = inspection input) |
+| `end-results` | `archive/$BK/…` reports/JSON/archive + `processed_batches.json` |
 | `wagon-eye-models` | production + reconstruction `.pt` (staged to `models/*` on EC2) |
 
 ## Models
