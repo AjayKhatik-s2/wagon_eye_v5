@@ -188,6 +188,11 @@ def build_legacy_view_model(
     loaded_count    = sum(1 for u in wagons_in_order if u.load_status == C.LOAD_LOADED)
     empty_count     = sum(1 for u in wagons_in_order if u.load_status == C.LOAD_EMPTY)
     ocr_captured    = sum(1 for u in wagons_in_order if u.wagon_identifier not in (None, "", C.NO_DATA))
+    # Loco numbers (5-digit, from ENGINE wagons' RIGHT_UP loco OCR), in rake order,
+    # deduped -- surfaced in the KPI summary, PDF filename, and email subject.
+    loco_numbers = list(dict.fromkeys(
+        u.loco_number for u in wagons_in_order
+        if getattr(u, "loco_number", C.NO_DATA) not in (None, "", C.NO_DATA)))
 
     any_anomaly = any(u.anomalies for u in wagons_in_order)
     vm.summary_kpis = {
@@ -206,7 +211,7 @@ def build_legacy_view_model(
         "ocr_captured":    ocr_captured,
         "rake_type":       _rake_type(wagons_in_order),
         "status":          "NOT OK" if any_anomaly else "OK",
-        "loco_numbers":    [],
+        "loco_numbers":    loco_numbers,
     }
 
     # merged_wagons + per-camera doors

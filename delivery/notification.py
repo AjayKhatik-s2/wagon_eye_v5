@@ -36,10 +36,12 @@ def send_email(
     ist = timezone(timedelta(hours=5, minutes=30))
     date_time_str = datetime.now(ist).strftime("%d-%m-%Y - %H:%M")
 
+    _locos = summary.get("loco_numbers") or []
+    _loco_str = ",".join(str(x) for x in _locos) if _locos else "—"
     subject = (
         f"WagonEye Combined Report | v4 | "
         f"{batch_key} | wagons={summary.get('total_wagons', 0)} | "
-        f"{date_time_str}"
+        f"loco={_loco_str} | {date_time_str}"
     )
     context = {
         "report_date":   date_time_str,

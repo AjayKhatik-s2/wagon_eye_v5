@@ -29,6 +29,10 @@ class UnifiedWagonState:
     wagon_identifier: str = C.NO_DATA
     wagon_identifier_confidence: float = 0.0
 
+    # Loco number (5-digit) -- populated on ENGINE wagons by RIGHT_UP loco OCR.
+    loco_number: str = C.NO_DATA
+    loco_number_confidence: float = 0.0
+
     # Doors (side cameras)
     left_door: str = C.NO_DATA
     left_door_confidence: float = 0.0
@@ -98,4 +102,8 @@ def summarize_wagons(wagons: List[UnifiedWagonState]) -> Dict[str, Any]:
         "top_damaged":      sum(1 for w in wagons if w.top_damage == C.DAMAGE_PRESENT),
         "side_damaged":     sum(1 for w in wagons if w.side_damage == C.DAMAGE_PRESENT),
         "ocr_captured":     sum(1 for w in wagons if w.wagon_identifier != C.NO_DATA),
+        # 5-digit loco numbers (ENGINE wagons), rake order, deduped.
+        "loco_numbers":     list(dict.fromkeys(
+            w.loco_number for w in wagons
+            if getattr(w, "loco_number", C.NO_DATA) not in (None, "", C.NO_DATA))),
     }

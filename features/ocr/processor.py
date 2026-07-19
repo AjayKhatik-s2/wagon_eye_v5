@@ -1,8 +1,14 @@
 """OCR feature processor (v4, train-state-native, ALL legacy intelligence
 ported).
 
+Milestone 1: uses the PRODUCTION wagon-number detector `wagon_number.pt` (via
+core.production_models) with the production-lineage OCR engine below (the
+6-step preprocessing + Indian-Railways confusion-map correction ARE production
+behaviour). Loco-number (5-digit) OCR is a documented remaining item (needs the
+loco-region detector wired) -- see the end-to-end summary.
+
 Pipeline:
-    1. YOLO `wagon_id_counting.pt` detects wagon-number bbox regions on
+    1. YOLO `wagon_number.pt` detects wagon-number bbox regions on
        RIGHT_UP frames (master / OCR authority).
     2. Each crop is fed through the legacy `WagonNumberOCR`:
            padding 10 -> 3x cubic upscale -> NLMeans denoise (h=8) ->
@@ -32,13 +38,17 @@ Output JSON shape:
 from __future__ import annotations
 
 import os
+import re
 import time
 import traceback
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 
 from core import constants as C
+from core import config as CFG
+from core import production_models as PM
 from core.global_state_loader import GlobalTrainState
 
 from features._common import (
@@ -90,6 +100,99 @@ def _get_ocr() -> Optional[WagonNumberOCR]:
 
 
 # -----------------------------------------------------------------------------
+# Loco-number OCR (production: 5-digit numbers on locomotives / ENGINE wagons)
+# -----------------------------------------------------------------------------
+# Production reads the 5-digit loco number from the gap+loco model's `locono`
+# detections on RIGHT_UP. The reconstruction gap model (right_up_gap.pt) already
+# emits `locono`; we run it on ENGINE wagons' RIGHT_UP frames and read the crop
+# with the production-lineage OCR engine's preprocessing + reader.
+
+_LOCO_NUMBER_LENGTH = 5
+_LOCO_CONFIDENCE = 0.60                 # production LOCO_CONFIDENCE_THRESHOLD
+_LOCO_CLASS = "locono"
+_LOCO_DET_FILENAMES = ("right_up_gap.pt", "right_up_wagon_gap.pt")
+
+_LOCO_DET_SINGLETON: Optional[Any] = None
+_LOCO_DET_TRIED = False
+
+
+def _get_loco_detector():
+    """Cached loco-region detector (the reconstruction gap model, `locono`)."""
+    global _LOCO_DET_SINGLETON, _LOCO_DET_TRIED
+    if _LOCO_DET_TRIED:
+        return _LOCO_DET_SINGLETON
+    _LOCO_DET_TRIED = True
+    for fn in _LOCO_DET_FILENAMES:
+        m = load_yolo(os.path.join(CFG.RECON_MODELS_DIR, fn))
+        if m is not None:
+            _LOCO_DET_SINGLETON = m
+            break
+    return _LOCO_DET_SINGLETON
+
+
+def _read_loco_number(ocr, crop) -> tuple[str, float]:
+    """Read a 5-digit loco number from a `locono` crop using the production OCR
+    engine's preprocessing + reader. Row-cluster digits top-to-bottom then
+    left-to-right; return the number only when it is exactly 5 digits."""
+    if ocr is None or getattr(ocr, "reader", None) is None or crop is None or crop.size == 0:
+        return "", 0.0
+    try:
+        pre = ocr.preprocess_crop(crop)
+        results = ocr.reader.readtext(pre, allowlist="0123456789")
+    except Exception:
+        return "", 0.0
+    if not results:
+        return "", 0.0
+
+    def cy(r): return sum(p[1] for p in r[0]) / len(r[0])
+    def cx(r): return sum(p[0] for p in r[0]) / len(r[0])
+    ordered = sorted(results, key=lambda r: (round(cy(r) / 10.0), cx(r)))
+    digits = "".join(re.sub(r"\D", "", str(r[1])) for r in ordered)
+    confs = [float(r[2]) for r in ordered if r[2] is not None]
+    conf = sum(confs) / len(confs) if confs else 0.0
+    return (digits, conf) if len(digits) == _LOCO_NUMBER_LENGTH else ("", 0.0)
+
+
+def _process_engine_loco(loco_model, ocr, cache_root: str, gw_id: str) -> Dict[str, Any]:
+    """Detect `locono` on an ENGINE wagon's RIGHT_UP frames, OCR each crop, and
+    vote for the dominant 5-digit loco number."""
+    votes: Counter = Counter()
+    conf_sum: Dict[str, float] = {}
+    used = 0
+    best = BestFrameTracker()
+    for fi, frame in iter_wagon_frames(cache_root, gw_id, C.CAMERA_RIGHT_UP, trim_stable=True):
+        used += 1
+        try:
+            res = loco_model(frame, verbose=False, half=HALF, device=DEVICE,
+                             conf=_LOCO_CONFIDENCE)[0]
+        except Exception:
+            continue
+        if res.boxes is None or len(res.boxes) == 0:
+            continue
+        boxes = res.boxes.xyxy.cpu().numpy()
+        clss = res.boxes.cls.cpu().numpy().astype(int)
+        names = getattr(loco_model, "names", {}) or {}
+        for bbox, cid in zip(boxes, clss):
+            if str(names.get(int(cid), "")).lower() != _LOCO_CLASS:
+                continue
+            bbox_list = [float(b) for b in bbox]
+            crop = crop_bbox(frame, bbox_list, pad=6)
+            num, ocr_conf = _read_loco_number(ocr, crop)
+            if num:
+                votes[num] += 1
+                conf_sum[num] = conf_sum.get(num, 0.0) + ocr_conf
+                if ocr_conf > best.score:
+                    best.update(score=ocr_conf, frame=frame, bbox=bbox_list, frame_idx=fi,
+                                loco_number=num, ocr_confidence=ocr_conf)
+    if not votes:
+        return {"used": used, "loco_number": "", "confidence": 0.0, "best": best, "votes": {}}
+    winner = max(votes, key=lambda n: (votes[n], conf_sum[n] / votes[n]))
+    return {"used": used, "loco_number": winner,
+            "confidence": conf_sum[winner] / votes[winner],
+            "best": best, "votes": dict(votes)}
+
+
+# -----------------------------------------------------------------------------
 # Per-wagon driver
 # -----------------------------------------------------------------------------
 
@@ -116,7 +219,9 @@ def _process_one_wagon(
 
         # Stage A: YOLO detection -- locate wagon-number bbox regions
         try:
-            results = yolo_model(frame, verbose=False, half=True)[0]
+            # device-aware: FP16 on CUDA, FP32 on CPU (hardcoded half=True
+            # errors on a CPU-only host).
+            results = yolo_model(frame, verbose=False, half=HALF, device=DEVICE)[0]
         except Exception:
             continue
         if results.boxes is None or len(results.boxes) == 0:
@@ -205,8 +310,15 @@ def run(
     if cameras is not None and camera_id not in cameras:
         return {}
 
-    model_path = os.path.join(feature_models_dir, C.MODEL_WAGON_ID_COUNTING)
-    yolo_model = load_yolo(model_path)
+    # PRODUCTION wagon-number bbox detector (wagon_number.pt) via the shared
+    # registry. Absent -> clear error -> NO_DATA for every wagon (no fake read).
+    del feature_models_dir  # model comes from core.production_models now
+    model_err: Optional[str] = None
+    try:
+        yolo_model = PM.load_for(FEATURE_NAME, camera_id)
+    except PM.MissingProductionModel as e:
+        yolo_model = None
+        model_err = str(e)
     ocr = _get_ocr()
 
     feature_out = feature_camera_dir(output_dir, FEATURE_NAME, camera_id)
@@ -214,7 +326,7 @@ def run(
     summary: Dict[str, str] = {}
 
     if yolo_model is None and verbose:
-        print(f"[FEAT/ocr] WARNING: {model_path} missing -- NO_DATA for all wagons.")
+        print(f"[FEAT/ocr] {model_err or 'wagon_number.pt missing'} -- NO_DATA for all wagons.")
     if ocr is None and verbose:
         print(f"[FEAT/ocr] WARNING: easyocr unavailable -- NO_DATA for all wagons.")
 
@@ -232,26 +344,66 @@ def run(
                     wagon_identifier=C.NO_DATA,
                     wagon_identifier_confidence=0.0,
                     candidates=[], supporting_cameras=[],
-                    error="detector or OCR engine unavailable",
+                    error=model_err or "detector or OCR engine unavailable",
                 )
                 write_per_wagon_json(feature_out, gw_id, payload)
                 summary[gw_id] = C.NO_DATA
                 continue
 
-            # ENGINE / BRAKE_VAN wagons rarely carry the standard 11-digit
-            # wagon number; running OCR on them produces noise.  Skip but
-            # still record the wagon entry.
-            if gw.classification in (C.CLASS_ENGINE, C.CLASS_BRAKE_VAN):
-                payload = empty_payload(
+            # BRAKE_VAN carries no standard number -> skip (record the entry).
+            if gw.classification == C.CLASS_BRAKE_VAN:
+                write_per_wagon_json(feature_out, gw_id, empty_payload(
                     gw_id, FEATURE_NAME, C.STATUS_OK,
-                    wagon_identifier=C.NO_DATA,
-                    wagon_identifier_confidence=0.0,
-                    candidates=[],
-                    supporting_cameras=[C.CAMERA_RIGHT_UP],
-                    skipped_reason=f"classification={gw.classification}",
-                )
-                write_per_wagon_json(feature_out, gw_id, payload)
+                    wagon_identifier=C.NO_DATA, wagon_identifier_confidence=0.0,
+                    loco_number=C.NO_DATA, loco_number_confidence=0.0, is_valid_5_digit=False,
+                    candidates=[], supporting_cameras=[C.CAMERA_RIGHT_UP],
+                    skipped_reason="classification=BRAKE_VAN"))
                 summary[gw_id] = C.STATUS_OK
+                continue
+
+            # ENGINE wagons -> production loco-number (5-digit) OCR.
+            if gw.classification == C.CLASS_ENGINE:
+                loco_model = _get_loco_detector()
+                lo = (_process_engine_loco(loco_model, ocr, cache_root, gw_id)
+                      if loco_model is not None else None)
+                loco_num = (lo or {}).get("loco_number") or ""
+                loco_conf = float((lo or {}).get("confidence", 0.0) or 0.0)
+                is_valid5 = len(loco_num) == _LOCO_NUMBER_LENGTH
+                loco_ev: Dict[str, str] = {}
+                bo = (lo or {}).get("best")
+                if evidence_root and is_valid5 and bo is not None and bo.has_data():
+                    final_dir = os.path.join(evidence_root, gw_id, FEATURE_NAME, camera_id)
+                    crop_img = safe_crop(bo.frame, bo.bbox, pad=4)
+                    with atomic_camera_evidence(evidence_root, gw_id, FEATURE_NAME, camera_id) as ev_tmp:
+                        annotated = draw_annotated_bbox(
+                            bo.frame, bo.bbox, label=f"LOCO {loco_num} {loco_conf:.2f}",
+                            color=(0, 255, 0))
+                        save_jpeg(os.path.join(ev_tmp, "loco_best.jpg"), annotated)
+                        if crop_img is not None:
+                            save_jpeg(os.path.join(ev_tmp, "loco_crop.jpg"), crop_img)
+                        write_metadata(os.path.join(ev_tmp, "metadata.json"), {
+                            "global_id": gw_id, "feature": FEATURE_NAME, "camera_id": camera_id,
+                            "loco_number": loco_num, "loco_confidence": round(loco_conf, 4),
+                            "frame_idx": bo.frame_idx, "bbox": bo.bbox})
+                    loco_ev["loco_best"] = os.path.join(final_dir, "loco_best.jpg")
+                    if crop_img is not None:
+                        loco_ev["loco_crop"] = os.path.join(final_dir, "loco_crop.jpg")
+                write_per_wagon_json(feature_out, gw_id, {
+                    "global_id": gw_id, "feature": FEATURE_NAME, "camera_id": camera_id,
+                    "status": C.STATUS_OK,
+                    "wagon_identifier": C.NO_DATA, "wagon_identifier_confidence": 0.0,
+                    "loco_number": loco_num or C.NO_DATA,
+                    "loco_number_confidence": round(loco_conf, 4),
+                    "is_valid_5_digit": is_valid5,
+                    "loco_vote_counts": (lo or {}).get("votes", {}),
+                    "candidates": [], "supporting_cameras": [C.CAMERA_RIGHT_UP],
+                    "skipped_reason": "classification=ENGINE (loco OCR)",
+                    "frame_count": int((lo or {}).get("used", 0)),
+                    "evidence": loco_ev,
+                })
+                summary[gw_id] = C.STATUS_OK
+                if verbose:
+                    print(f"  [ocr/{gw_id}] ENGINE loco={loco_num or '-'} ({loco_conf:.2f})")
                 continue
 
             outcome = _process_one_wagon(

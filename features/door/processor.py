@@ -1,44 +1,43 @@
-"""Door feature processor (v4, train-state-native, ALL legacy intelligence
-ported).
+"""Door feature processor -- PRODUCTION behaviour on the GlobalTrain wagon cache.
 
-Per wagon, for each side camera (RIGHT_UP / LEFT_UP):
+Milestone 1 reproduces the deployed production side-camera door logic EXACTLY,
+expressed on the wagon_cache instead of production's own per-camera segment
+extraction. The EXTERNAL CONTRACT is unchanged -- ``run()`` signature, the
+per-camera output ``wagon_states/door/<CAMERA>/GW_n.json`` payload keys
+(``right_door``/``left_door`` + ``*_door_confidence``, ``door_state``,
+``tracks``, ``supporting_cameras``, ``frame_count``, ``evidence``), and the
+evidence layout -- so orchestrator / lifecycle_runner / fusion / reporting /
+rendering consume it without modification. Only the internals differ.
 
-    1. Iterate cached JPEGs in wagon_cache/<GW_n>/<camera>/.
-    2. Score illumination quality per frame (legacy IlluminationProcessor).
-    3. Run YOLO door_state.pt on the raw frame.
-    4. Filter detections through the geometric shape prior (aspect ratio,
-       vertical-edge dominance, border completeness).
-    5. Feed surviving detections + quality score into the legacy
-       DoorTracker (Kalman + Hungarian + per-track 30-frame quality-
-       weighted majority vote + state machine with 2x hysteresis on
-       OPEN -> CLOSED transitions + sticky DAMAGE state).
-    6. After all frames, finalize the tracker -> per-track {state,
-       confidence, snapshot}.
-    7. Run DoorIdentityMerger to collapse fragmented tracks of the same
-       physical door (spatial + temporal + context + structural).
-    8. Pick the dominant door state per CAMERA SIDE.
+Production door logic (the side-camera ``side_damage.pt`` model emits both door
+and side-damage classes; this processor consumes ONLY the door classes --
+``damage`` is owned by the damage processor):
 
-The per-CAMERA dominant state IS the per-side door state (RIGHT_UP -> right
-door, LEFT_UP -> left door).  Same convention the legacy combined report
-used.
+  1. For each side camera (RIGHT_UP -> right door, LEFT_UP -> left door), iterate
+     the wagon's interior frames (production skips a fixed 10-frame margin at
+     each end -- ``_iter_segment_frames`` edge_skip).
+  2. Run ``side_damage.pt`` at the PRODUCTION per-camera confidence
+     (RIGHT_UP 0.85 / LEFT_UP 0.88 -- notebook-authoritative; see
+     WAGONEYE_V5_STAGE3_FEATURE_AUDIT.md V-1). Collect ``door_open`` /
+     ``door_close`` detections (frame, conf, bbox).
+  3. Band detections by frame proximity (``gap_tolerance = 5``), keeping each
+     band's highest-confidence frame (production ``_analyze_detection_bands``).
+  4. ``door_state = OPEN if any door_open band else CLOSED`` -- the exact
+     production two-state rule (``'open' if wagon_door_open else 'closed'``).
+     Production doors are never PARTIAL/DAMAGED, so those states never occur.
+  5. ``door_close_detected = any door_close band`` (additive audit field,
+     matching production's side JSON).
+  6. Evidence = the winning band's best frame, annotated (door_open red,
+     door_close green -- production colours).
 
-Output JSON shape (per wagon):
-    {
-        "global_id":   "GW_7",
-        "feature":     "door",
-        "status":      "OK" | "NO_FRAMES" | "FAILED" | "NO_DATA",
-        "left_door":   "CLOSED" | "OPEN" | "PARTIAL" | "DAMAGED" | "NO_DATA",
-        "left_door_confidence":  0.91,
-        "right_door":  "...",
-        "right_door_confidence": 0.83,
-        "tracks": [
-            {camera_id, track_id, state, confidence, first_frame,
-             last_frame, total_hits},
-            ...
-        ],
-        "supporting_cameras": ["LEFT_UP", "RIGHT_UP"],
-        "frame_count": ...,
-    }
+Deliberately NO Kalman/Hungarian tracking, FSM hysteresis, identity merging,
+illumination scoring, or geometric-shape prior: production does not use them for
+doors, and milestone 1 must not add behaviour the production system lacks. Those
+belong to the shelved v4-native door path (recoverable from git history).
+
+Graceful degradation: when the production model is absent the loader raises
+``MissingProductionModel`` and every wagon is written ``NO_DATA`` (with the
+reason) -- no dummy inference, no fabricated door state.
 """
 
 from __future__ import annotations
@@ -48,429 +47,259 @@ import time
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
+import cv2
 
 from core import constants as C
+from core import production_models as PM
 from core.global_state_loader import GlobalTrainState
-from core.frame_quality import (
-    detection_quality, snapshot_score, expand_bbox, _DOOR_BBOX_EXPAND_FRAC,
-)
 
 from features._common import (
-    load_yolo, iter_wagon_frames, list_wagon_frames,
-    write_per_wagon_json, empty_payload, FeatureTimer, feature_camera_dir,
-    DEVICE, HALF,
-)
-
-# Mature intelligence ported from legacy
-from features.inference_lib.door_tracker import (
-    DoorTracker, TrackerConfig, DoorState, yolo_to_detections,
-)
-from features.inference_lib.door_identity_merger import (
-    DoorIdentityMerger, MergeConfig,
-)
-from features.inference_lib.illumination_processor import (
-    IlluminationProcessor, IlluminationConfig,
-)
-from features.inference_lib.geometric_shape_prior import (
-    GeometricShapePrior, GeometricPriorConfig,
+    list_wagon_frames, write_per_wagon_json, feature_camera_dir,
+    FeatureTimer, DEVICE, HALF,
 )
 from features._evidence import (
-    BestFrameTracker, atomic_camera_evidence,
+    atomic_camera_evidence, read_cached_frame,
     save_jpeg, safe_crop, write_metadata, draw_annotated_bbox,
 )
 
 
 FEATURE_NAME = "door"
 
-
-# -----------------------------------------------------------------------------
-# Canonicalization of legacy state strings
-# -----------------------------------------------------------------------------
-
-# DoorTracker.DoorState values are: UNKNOWN / CLOSED / OPEN / PARTIAL_CLOSED /
-# DAMAGE / OTHER.  Map to the v4 canonical vocabulary.
-_STATE_TO_CANONICAL = {
-    "OPEN":            C.DOOR_OPEN,
-    "CLOSED":          C.DOOR_CLOSED,
-    "PARTIAL_CLOSED":  C.DOOR_PARTIAL,
-    "PARTIAL":         C.DOOR_PARTIAL,
-    "DAMAGE":          C.DOOR_DAMAGED,
-    "DAMAGED":         C.DOOR_DAMAGED,
-    "OTHER":           C.NO_DATA,
-    "UNKNOWN":         C.NO_DATA,
-}
-
-
-def _canonical(state_value: str) -> str:
-    s = str(state_value or "").strip().upper()
-    return _STATE_TO_CANONICAL.get(s, s if s else C.NO_DATA)
-
-
-# -----------------------------------------------------------------------------
-# Per-camera tracker run
-# -----------------------------------------------------------------------------
-
-def _run_tracker_one_camera(
-    yolo_model,
-    illumination: IlluminationProcessor,
-    geo_prior: GeometricShapePrior,
-    tracker_config: TrackerConfig,
-    merger_config: MergeConfig,
-    cache_root: str,
-    gw_id: str,
-    camera_id: str,
-) -> Tuple[List[Dict[str, Any]], int, int, int, Dict[str, "BestFrameTracker"]]:
-    """Run the full per-camera door pipeline on one wagon.
-
-    Returns:
-        (track_decisions, n_frames, width, height, evidence_candidates)
-
-    ``evidence_candidates`` is a ``{canonical_state -> BestFrameTracker}`` map.
-    For each door state observed on this camera we keep the single highest
-    snapshot-quality frame (legacy ``_score_detection``: area + horizontal
-    centre + confidence + crop quality, with an edge-hugging penalty).  The
-    caller picks the bucket matching the wagon's reported side-state so the
-    persisted snapshot actually shows that (often anomalous) state, falling
-    back to the globally best-scored frame when no such frame exists.
-    """
-    paths = list_wagon_frames(cache_root, gw_id, camera_id, trim_stable=True)
-    if not paths:
-        return [], 0, 0, 0, {}, {"tracks": [], "events": []}
-
-    # Fresh tracker per (gw, camera).  Wagons are independent in the new
-    # train-state-native world, so each one resets the tracker.
-    tracker = DoorTracker(config=tracker_config)
-    tracker.reset()
-
-    frame_w, frame_h = 0, 0
-    used = 0
-    cands: Dict[str, BestFrameTracker] = {}
-
-    # Per-frame confirmed-track positions for the Stage-4b overlay.  We record
-    # the Kalman-smoothed tlbr + FSM state of every CONFIRMED track after each
-    # tracker step -- including frames where the door was only predicted (no
-    # detection) -- exactly mirroring how the legacy door_processor wrote its
-    # `_tracked.mp4` (draws `track.tlbr` for confirmed tracks every frame, so
-    # boxes glide smoothly through detection-less frames).  Persisting it lets
-    # the visualization-only renderer replay the motion WITHOUT re-running any
-    # detector.  Keyed by track_id.
-    trajectory: Dict[int, Dict[str, Any]] = {}
-    # Ordered absolute cache frame indices, one entry per tracker.update() step.
-    # DoorTracker numbers its events with an INTERNAL 1-based step counter
-    # (self.frame_idx, ++ per update), but the renderer keys the event banner by
-    # ABSOLUTE cache frame index.  _snapshot_confirmed runs exactly once per
-    # tracker.update(), so recording `fi` here builds the step->absolute map used
-    # to translate event frames at finalize -- otherwise the banner fires on the
-    # wrong frame / a neighbouring wagon's span.
-    step_to_abs: List[int] = []
-
-    def _snapshot_confirmed(frame_index: int) -> None:
-        step_to_abs.append(int(frame_index))
-        for t in tracker.tracks:
-            if not t.is_confirmed():
-                continue
-            try:
-                bb = [float(v) for v in t.tlbr]
-            except Exception:
-                continue
-            # ITEM 4: expand the persisted overlay box so the processed-video
-            # rectangle visually contains the WHOLE door (matches the expanded
-            # evidence crop below).  Clipped to the frame; still a clean rect.
-            bb = expand_bbox(bb, _DOOR_BBOX_EXPAND_FRAC, frame_w, frame_h)
-            try:
-                vel = [float(t.velocity[0]), float(t.velocity[1])]
-            except Exception:
-                vel = [0.0, 0.0]
-            # Persist the RAW legacy fields the overlay needs to reproduce the
-            # exact legacy door annotation: the raw DoorState value (for colour
-            # + label), last_class (UNKNOWN colour/label fallback), the raw
-            # last-frame confidence, and the velocity vector (arrow).
-            entry = trajectory.setdefault(int(t.track_id), {
-                "camera_id": camera_id,
-                "track_id":  int(t.track_id),
-                "frames":    [],
-            })
-            entry["frames"].append({
-                "frame_idx":  int(frame_index),
-                "bbox":       bb,
-                "state_raw":  str(t.state_machine.get_state().value),
-                "last_class": str(getattr(t, "last_class", "") or ""),
-                "confidence": float(getattr(t, "last_confidence", 0.0) or 0.0),
-                "velocity":   vel,
-            })
-
-    # ------- frame loop (stable interior only) -------
-    for fi, frame in iter_wagon_frames(cache_root, gw_id, camera_id, trim_stable=True):
-        if frame_w == 0:
-            frame_h, frame_w = frame.shape[:2]
-        used += 1
-
-        # 1) quality score (does NOT alter the frame; YOLO sees raw bytes,
-        #    matching the legacy pipeline).
-        try:
-            ill_res = illumination.process_frame(frame, frame_idx=fi)
-            quality = float(getattr(ill_res, "quality_score", 1.0))
-        except Exception:
-            quality = 1.0
-
-        # 2) YOLO detection on raw frame
-        # half/device from the process-resolved DEVICE: on GPU this stays
-        # half=True (identical to pre-migration); on CPU it drops to FP32.
-        try:
-            results = yolo_model(frame, verbose=False, half=HALF, device=DEVICE)[0]
-        except Exception:
-            continue
-        if results.boxes is None or len(results.boxes) == 0:
-            tracker.update([], frame=frame,
-                           frame_width=frame_w, frame_height=frame_h)
-            _snapshot_confirmed(fi)
-            continue
-
-        boxes = results.boxes.xyxy.cpu().numpy()
-        confs = results.boxes.conf.cpu().numpy()
-        clss  = results.boxes.cls.cpu().numpy().astype(int)
-
-        # 3) confidence floor (the tracker has its own per-class thresholds
-        #    too; this gate just discards obviously-noisy detections early).
-        min_conf = float(tracker_config.closed_confidence_threshold)
-        keep = confs >= min_conf
-        boxes, confs, clss = boxes[keep], confs[keep], clss[keep]
-        if len(boxes) == 0:
-            tracker.update([], frame=frame,
-                           frame_width=frame_w, frame_height=frame_h)
-            _snapshot_confirmed(fi)
-            continue
-
-        # 4) geometric prior filter (aspect ratio / vertical-edge / border)
-        try:
-            boxes, confs, clss, _idx = geo_prior.filter_detections(
-                frame, boxes, confs, clss,
-            )
-        except Exception:
-            pass
-
-        # 5) convert to Detection objects + feed tracker
-        names = getattr(yolo_model, "names", {}) or {}
-        detections = yolo_to_detections(
-            boxes=boxes, confidences=confs, class_ids=clss,
-            class_names=names, illumination_quality=quality,
-        )
-        tracker.update(
-            detections=detections,
-            frame=frame,
-            frame_width=frame_w,
-            frame_height=frame_h,
-        )
-        _snapshot_confirmed(fi)
-
-        # 6) evidence:  bucket each surviving detection by its canonical state
-        # and keep the single highest snapshot-QUALITY frame per state (legacy
-        # _score_detection -- area + horizontal centre + confidence + crop
-        # quality, edge-hugging penalty).  This is what makes the persisted
-        # snapshot sharp / centred / non-edge instead of merely high-confidence.
-        for bbox, conf, cls_id in zip(boxes, confs, clss):
-            cls_name = str(names.get(int(cls_id), "")).lower()
-            canon = _canonical(cls_name)
-            bbox_list = [float(bbox[0]), float(bbox[1]),
-                         float(bbox[2]), float(bbox[3])]
-            # Score on the RAW detection box (true area / centre / quality).
-            crop_q = detection_quality(frame, bbox_list)
-            sc = snapshot_score(bbox_list, float(conf), crop_q,
-                                frame_w, frame_h)
-            # ITEM 4: persist an EXPANDED box so the evidence crop + annotated
-            # frame + metadata bbox visually contain the WHOLE door, consistent
-            # with the expanded overlay box.
-            bbox_store = expand_bbox(bbox_list, _DOOR_BBOX_EXPAND_FRAC,
-                                     frame_w, frame_h)
-            bucket = cands.setdefault(canon, BestFrameTracker())
-            if sc > bucket.score:
-                bucket.update(
-                    score=sc, frame=frame, bbox=bbox_store, frame_idx=fi,
-                    state=canon, confidence=float(conf),
-                    raw_class=cls_name, quality=float(crop_q),
-                )
-
-    # ------- finalize -------
-    # Bundle the per-frame trajectory + door-level events for the overlay.
-    def _abs_event_frame(rel: Any) -> int:
-        # DoorTracker numbers events with a 1-based internal step counter; step k
-        # corresponds to step_to_abs[k-1] (the absolute cache frame index).
-        try:
-            k = int(rel)
-        except (TypeError, ValueError):
-            return -1
-        if 1 <= k <= len(step_to_abs):
-            return step_to_abs[k - 1]
-        return -1
-
-    overlay = {
-        "tracks": list(trajectory.values()),
-        "events": [
-            {"frame_idx": _abs_event_frame(e.get("frame_idx", -1)),
-             "event":     str(e.get("event", "")),
-             "track_id":  int(e.get("track_id", -1)),
-             "camera_id": camera_id}
-            for e in (tracker.get_events() or [])
-        ],
-    }
-    final_states = tracker.get_final_door_states()
-    if not final_states:
-        return [], used, frame_w, frame_h, cands, overlay
-
-    # Run identity merger on the final track set (collapses fragmented IDs
-    # of the same physical door).  Operates on the live + deleted track
-    # objects exposed by the tracker.
-    try:
-        merger = DoorIdentityMerger(config=merger_config)
-        all_tracks_objs = list(tracker.tracks) + list(tracker.deleted_tracks)
-        merged_groups = merger.merge_all_tracks(all_tracks_objs)
-        # merge_all_tracks returns mapping {canonical_id: [member_ids]};
-        # we keep the canonical id for each group as the surviving track.
-        if isinstance(merged_groups, dict) and merged_groups:
-            merged_ids = set(merged_groups.keys())
-        elif isinstance(merged_groups, list) and merged_groups:
-            merged_ids = set(merged_groups)
-        else:
-            merged_ids = set(final_states.keys())
-    except Exception:
-        merged_ids = set(final_states.keys())   # fallback: keep everything
-
-    decisions: List[Dict[str, Any]] = []
-    all_tracks = list(tracker.tracks) + list(tracker.deleted_tracks)
-    by_id = {t.track_id: t for t in all_tracks}
-
-    for tid, state_dict in final_states.items():
-        if merged_ids and tid not in merged_ids:
-            continue
-        tr = by_id.get(tid)
-        mean_cx = float(np.mean([d['bbox'][[0,2]].mean()
-                                 for d in (tr.detections if tr else [])])) \
-            if (tr and getattr(tr, "detections", None)) else 0.0
-        decisions.append({
-            "camera_id":   camera_id,
-            "track_id":    tid,
-            "state":       _canonical(state_dict.get("state")),
-            "confidence":  float(state_dict.get("confidence", 0.0) or 0.0),
-            "first_frame": int(state_dict.get("first_frame", 0)),
-            "last_frame":  int(state_dict.get("last_frame", 0)),
-            "total_hits":  int(state_dict.get("total_hits", 0)),
-            "mean_center_x": mean_cx,
-        })
-    return decisions, used, frame_w, frame_h, cands, overlay
-
-
-# -----------------------------------------------------------------------------
-# Per-side decision picker
-# -----------------------------------------------------------------------------
-
-def _pick_side_state(track_decisions: List[Dict[str, Any]]) -> Tuple[str, float]:
-    """Pick the dominant door state for one camera/side.
-
-    Priority order:
-        1. Any DAMAGED track  -> DAMAGED (terminal in the FSM)
-        2. Any OPEN track     -> OPEN  (safety-critical; legacy code biases here)
-        3. Any PARTIAL track  -> PARTIAL
-        4. Most-frequent CLOSED-class result by total_hits, confidence weighted
-        5. NO_DATA
-    """
-    if not track_decisions:
-        return C.NO_DATA, 0.0
-
-    def _max_conf(items):
-        return max(items, key=lambda d: (d["total_hits"], d["confidence"]))
-
-    damaged = [d for d in track_decisions if d["state"] == C.DOOR_DAMAGED]
-    if damaged:
-        best = _max_conf(damaged)
-        return C.DOOR_DAMAGED, best["confidence"]
-
-    opens = [d for d in track_decisions if d["state"] == C.DOOR_OPEN]
-    if opens:
-        best = _max_conf(opens)
-        return C.DOOR_OPEN, best["confidence"]
-
-    partials = [d for d in track_decisions if d["state"] == C.DOOR_PARTIAL]
-    if partials:
-        best = _max_conf(partials)
-        return C.DOOR_PARTIAL, best["confidence"]
-
-    closeds = [d for d in track_decisions if d["state"] == C.DOOR_CLOSED]
-    if closeds:
-        best = _max_conf(closeds)
-        return C.DOOR_CLOSED, best["confidence"]
-
-    return C.NO_DATA, 0.0
-
-
-def _resolve_evidence(
-    cands: Dict[str, "BestFrameTracker"], reported_state: str,
-) -> "BestFrameTracker":
-    """Pick the evidence frame for one side.
-
-    Prefer the highest snapshot-quality frame that actually shows the wagon's
-    reported side-state (anomaly-central: an OPEN/DAMAGED snapshot for an
-    OPEN/DAMAGED door).  If no frame of that state was captured, fall back to
-    the globally best-scored frame on the camera.
-    """
-    bucket = cands.get(reported_state)
-    if bucket is not None and bucket.has_data():
-        return bucket
-    best = BestFrameTracker()
-    for b in cands.values():
-        if b.has_data() and b.score > best.score:
-            best = b
-    return best
-
-
-# -----------------------------------------------------------------------------
-# Public entry
-# -----------------------------------------------------------------------------
-
+# RIGHT_UP -> right door, LEFT_UP -> left door (production side->door convention).
 _SIDE_FOR_CAMERA = {C.CAMERA_RIGHT_UP: "right", C.CAMERA_LEFT_UP: "left"}
 
+# PRODUCTION per-camera detection confidence for the side model (notebook-
+# authoritative: DAMAGE_CONFIDENCE = 0.85 right_up / 0.88 left_up). One model
+# gates both doors and side damage; this is the door pass.
+_SIDE_DOOR_CONF = {C.CAMERA_RIGHT_UP: 0.85, C.CAMERA_LEFT_UP: 0.88}
+
+# Fixed edge margin skipped at each end of a wagon's frame span (production
+# _iter_segment_frames edge_skip_frames = 10).
+_EDGE_SKIP_FRAMES = 10
+
+# Band gap tolerance for grouping door detections (production
+# _analyze_detection_bands gap_tolerance = 5).
+_BAND_GAP_TOLERANCE = 5
+
+# Production side-damage door class names + annotation colours (BGR).
+_CLASS_DOOR_OPEN = "door_open"
+_CLASS_DOOR_CLOSE = "door_close"
+_COLOR_DOOR_OPEN = (0, 0, 255)     # red
+_COLOR_DOOR_CLOSE = (0, 255, 0)    # green
+
+
+# -----------------------------------------------------------------------------
+# Band grouping (port of production _analyze_detection_bands)
+# -----------------------------------------------------------------------------
+
+def _analyze_bands(
+    detections: List[Tuple[int, float, float, float, float, float]],
+    gap_tolerance: int,
+) -> List[Dict[str, Any]]:
+    """Group ``(frame, conf, x1, y1, x2, y2)`` detections into bands.
+
+    A new band starts when the frame gap exceeds ``gap_tolerance + 1``. Each
+    band records its highest-confidence frame as the representative
+    (``best_frame`` / ``best_conf`` / ``best_bbox``), matching production.
+    """
+    if not detections:
+        return []
+    dets = sorted(detections, key=lambda d: d[0])
+    bands: List[Dict[str, Any]] = []
+    cur = {
+        "band_id": 1, "start": dets[0][0], "end": dets[0][0],
+        "frames": [dets[0][0]], "confs": [dets[0][1]], "dets": [dets[0]],
+    }
+    for d in dets[1:]:
+        if d[0] - cur["end"] <= gap_tolerance + 1:
+            cur["end"] = d[0]
+            if d[0] not in cur["frames"]:
+                cur["frames"].append(d[0])
+            cur["confs"].append(d[1])
+            cur["dets"].append(d)
+        else:
+            bands.append(cur)
+            cur = {
+                "band_id": len(bands) + 1, "start": d[0], "end": d[0],
+                "frames": [d[0]], "confs": [d[1]], "dets": [d],
+            }
+    bands.append(cur)
+    for b in bands:
+        best = max(b["dets"], key=lambda d: d[1])
+        b["best_frame"] = int(best[0])
+        b["best_conf"] = float(best[1])
+        b["best_bbox"] = [float(best[2]), float(best[3]), float(best[4]), float(best[5])]
+        b["avg_conf"] = sum(b["confs"]) / len(b["confs"])
+        b["frame_count"] = len(set(b["frames"]))
+    return bands
+
+
+def _parse_frame_index(path: str) -> int:
+    """Absolute cache frame index from ``frame_NNNNNN.jpg`` (or -1)."""
+    try:
+        return int(os.path.basename(path).split("_")[1].split(".")[0])
+    except (IndexError, ValueError):
+        return -1
+
+
+def _interior_frames(paths: List[str]) -> List[str]:
+    """Frames with the fixed production edge margin removed from each end.
+
+    Mirrors ``_iter_segment_frames``: when the span is too short to leave an
+    interior (``2 * edge_skip``), no interior frames exist -> no detections ->
+    the wagon reports the production CLOSED default.
+    """
+    n = len(paths)
+    if n <= 2 * _EDGE_SKIP_FRAMES:
+        return []
+    return paths[_EDGE_SKIP_FRAMES:n - _EDGE_SKIP_FRAMES]
+
+
+# -----------------------------------------------------------------------------
+# Payload builders (keep the exact door JSON contract fusion/reporting read)
+# -----------------------------------------------------------------------------
+
+def _base_payload(gw_id: str, camera_id: str, side: str, status: str) -> Dict[str, Any]:
+    return {
+        "global_id": gw_id,
+        "feature": FEATURE_NAME,
+        "camera_id": camera_id,
+        "side": side,
+        "status": status,
+    }
+
+
+def _empty_door_payload(
+    gw_id: str, camera_id: str, side: str, status: str, **extra: Any,
+) -> Dict[str, Any]:
+    """NO_FRAMES / NO_DATA / FAILED payload with the full door key surface so
+    the fusion adapter reads a clean NO_DATA rather than a missing key."""
+    p = _base_payload(gw_id, camera_id, side, status)
+    p.update({
+        "door_state": C.NO_DATA,
+        "door_confidence": 0.0,
+        f"{side}_door": C.NO_DATA,
+        f"{side}_door_confidence": 0.0,
+        "door_close_detected": False,
+        "tracks": [],
+        "supporting_cameras": [],
+        "frame_count": 0,
+        "evidence": {},
+    })
+    p.update(extra)
+    return p
+
+
+def _bands_to_tracks(
+    bands: List[Dict[str, Any]], camera_id: str, door_state: str,
+) -> List[Dict[str, Any]]:
+    """Represent each detection band as a track record (preserves the
+    ``tracks[]`` key shape reporting/rendering may read)."""
+    tracks: List[Dict[str, Any]] = []
+    for b in bands:
+        cx = (b["best_bbox"][0] + b["best_bbox"][2]) / 2.0
+        tracks.append({
+            "camera_id": camera_id,
+            "track_id": int(b["band_id"]),
+            "state": door_state,
+            "confidence": round(float(b["best_conf"]), 4),
+            "first_frame": int(b["start"]),
+            "last_frame": int(b["end"]),
+            "total_hits": int(b["frame_count"]),
+            "mean_center_x": float(cx),
+        })
+    return tracks
+
+
+# -----------------------------------------------------------------------------
+# Per-wagon, per-camera door pass
+# -----------------------------------------------------------------------------
 
 def _process_wagon_camera_door(
-    yolo_model, illumination, geo_prior, tracker_cfg, merger_cfg,
-    cache_root: str, gw, camera_id: str, feature_out: str,
-    evidence_root: Optional[str], verbose: bool,
+    model, cam_conf: float, cache_root: str, gw, camera_id: str, side: str,
+    feature_out: str, evidence_root: Optional[str], verbose: bool,
 ) -> str:
-    """Run the door pipeline for ONE side camera on ONE wagon; write
-    door/<CAMERA>/<gw>.json (RIGHT_UP -> right door, LEFT_UP -> left door)."""
     gw_id = gw.global_id
-    side = _SIDE_FOR_CAMERA[camera_id]
-
-    decisions, used, _, _, cands, overlay = _run_tracker_one_camera(
-        yolo_model, illumination, geo_prior, tracker_cfg, merger_cfg,
-        cache_root, gw_id, camera_id,
-    )
-    if used == 0:
-        write_per_wagon_json(feature_out, gw_id, empty_payload(
-            gw_id, FEATURE_NAME, C.STATUS_NO_FRAMES,
-            camera_id=camera_id, side=side,
-            door_state=C.NO_DATA, door_confidence=0.0,
-            tracks=[], supporting_cameras=[],
-        ))
+    paths = list_wagon_frames(cache_root, gw_id, camera_id)  # sorted; no adaptive trim
+    if not paths:
+        write_per_wagon_json(feature_out, gw_id, _empty_door_payload(
+            gw_id, camera_id, side, C.STATUS_NO_FRAMES))
         return C.STATUS_NO_FRAMES
 
-    st, cf = _pick_side_state(decisions)
-    # frames existed but no confirmed track -> conservative legacy CLOSED default
-    if st == C.NO_DATA:
-        st, cf = C.DOOR_CLOSED, 0.0
-    best = _resolve_evidence(cands, st)
+    interior = _interior_frames(paths)
+    open_dets: List[Tuple[int, float, float, float, float, float]] = []
+    close_dets: List[Tuple[int, float, float, float, float, float]] = []
+    used = 0
+    names = getattr(model, "names", {}) or {}
 
+    for p in interior:
+        frame = cv2.imread(p)
+        if frame is None:
+            continue
+        used += 1
+        fi = _parse_frame_index(p)
+        # Production ran the side model with conf=DAMAGE_CONFIDENCE, so the
+        # confidence floor is applied at inference time (identical outcome).
+        try:
+            res = model(frame, verbose=False, half=HALF, device=DEVICE, conf=cam_conf)[0]
+        except Exception:
+            continue
+        if res.boxes is None or len(res.boxes) == 0:
+            continue
+        boxes = res.boxes.xyxy.cpu().numpy()
+        confs = res.boxes.conf.cpu().numpy()
+        clss = res.boxes.cls.cpu().numpy().astype(int)
+        for bbox, conf, cid in zip(boxes, confs, clss):
+            cname = str(names.get(int(cid), "")).lower()
+            rec = (fi, float(conf), float(bbox[0]), float(bbox[1]),
+                   float(bbox[2]), float(bbox[3]))
+            if cname == _CLASS_DOOR_OPEN:
+                open_dets.append(rec)
+            elif cname == _CLASS_DOOR_CLOSE:
+                close_dets.append(rec)
+            # 'damage' class is owned by the damage processor -- ignored here.
+
+    open_bands = _analyze_bands(open_dets, _BAND_GAP_TOLERANCE)
+    close_bands = _analyze_bands(close_dets, _BAND_GAP_TOLERANCE)
+
+    # Production rule: door_status = 'open' if any door_open band else 'closed'.
+    if open_bands:
+        door_state = C.DOOR_OPEN
+        winning = max(open_bands, key=lambda b: b["best_conf"])
+        conf = winning["best_conf"]
+        reported_class = _CLASS_DOOR_OPEN
+        evidence_color = _COLOR_DOOR_OPEN
+        src_bands = open_bands
+    else:
+        door_state = C.DOOR_CLOSED
+        if close_bands:
+            winning = max(close_bands, key=lambda b: b["best_conf"])
+            conf = winning["best_conf"]
+        else:
+            winning = None
+            conf = 0.0
+        reported_class = _CLASS_DOOR_CLOSE
+        evidence_color = _COLOR_DOOR_CLOSE
+        src_bands = close_bands
+
+    door_close_detected = bool(close_bands)
+    tracks = _bands_to_tracks(src_bands, camera_id, door_state)
+
+    # ---- evidence: the winning band's best frame, annotated ----
     evidence_paths: Dict[str, str] = {}
-    if evidence_root and (best.has_data() or overlay.get("tracks") or overlay.get("events")):
-        final_dir = os.path.join(evidence_root, gw_id, FEATURE_NAME, camera_id)
-        crop_img = safe_crop(best.frame, best.bbox, pad=12) if best.has_data() else None
-        with atomic_camera_evidence(evidence_root, gw_id, FEATURE_NAME,
-                                    camera_id) as ev_tmp:
-            if best.has_data():
+    if evidence_root and winning is not None:
+        best_fi = winning["best_frame"]
+        best_bbox = winning["best_bbox"]
+        best_frame = read_cached_frame(
+            cache_root, gw_id, C.CAMERA_FOLDER[camera_id], best_fi)
+        if best_frame is not None:
+            crop_img = safe_crop(best_frame, best_bbox, pad=12)
+            with atomic_camera_evidence(evidence_root, gw_id, FEATURE_NAME,
+                                        camera_id) as ev_tmp:
                 annotated = draw_annotated_bbox(
-                    best.frame, best.bbox,
-                    label=f"{best.meta.get('state','?')} "
-                          f"{best.meta.get('confidence',0.0):.2f}",
-                    color=(0, 255, 255),
+                    best_frame, best_bbox,
+                    label=f"{reported_class.upper()} {conf:.2f}",
+                    color=evidence_color,
                 )
                 save_jpeg(os.path.join(ev_tmp, f"{side}_best.jpg"), annotated)
                 if crop_img is not None:
@@ -479,47 +308,40 @@ def _process_wagon_camera_door(
                     "global_id": gw_id, "feature": FEATURE_NAME,
                     "camera_id": camera_id, "side": side,
                     "sides": {side: {
-                        "camera_id": camera_id, "frame_idx": best.frame_idx,
-                        "bbox": best.bbox, "state": best.meta.get("state"),
-                        "confidence": best.meta.get("confidence"),
-                        "raw_class": best.meta.get("raw_class"),
-                        "quality": best.meta.get("quality"),
+                        "camera_id": camera_id, "frame_idx": int(best_fi),
+                        "bbox": best_bbox, "state": door_state,
+                        "confidence": round(float(conf), 4),
+                        "raw_class": reported_class,
                     }},
                 })
-            if overlay.get("tracks") or overlay.get("events"):
-                write_metadata(os.path.join(ev_tmp, "overlay.json"), {
-                    "global_id": gw_id, "feature": FEATURE_NAME,
-                    "camera_id": camera_id,
-                    "tracks": overlay.get("tracks", []),
-                    "events": overlay.get("events", []),
-                })
-        if best.has_data():
+            final_dir = os.path.join(evidence_root, gw_id, FEATURE_NAME, camera_id)
             evidence_paths[f"{side}_best"] = os.path.join(final_dir, f"{side}_best.jpg")
             if crop_img is not None:
                 evidence_paths[f"{side}_crop"] = os.path.join(final_dir, f"{side}_crop.jpg")
 
-    payload: Dict[str, Any] = {
-        "global_id": gw_id,
-        "feature":   FEATURE_NAME,
-        "camera_id": camera_id,
-        "side":      side,
-        "status":    C.STATUS_OK,
-        "door_state":      st,
-        "door_confidence": round(float(cf), 4),
-        # convenience side-keyed fields so the Stage-4 adapter is trivial
-        f"{side}_door":            st,
-        f"{side}_door_confidence": round(float(cf), 4),
-        "tracks":      decisions,
+    payload = _base_payload(gw_id, camera_id, side, C.STATUS_OK)
+    payload.update({
+        "door_state": door_state,
+        "door_confidence": round(float(conf), 4),
+        f"{side}_door": door_state,
+        f"{side}_door_confidence": round(float(conf), 4),
+        "door_close_detected": door_close_detected,
+        "tracks": tracks,
         "supporting_cameras": [camera_id],
         "frame_count": used,
-    }
-    payload["evidence"] = evidence_paths
+        "evidence": evidence_paths,
+    })
     write_per_wagon_json(feature_out, gw_id, payload)
     if verbose:
-        print(f"  [door/{camera_id}/{gw_id}] {side}={st} ({cf:.2f})  "
-              f"tracks={len(decisions)}  frames={used}")
+        print(f"  [door/{camera_id}/{gw_id}] {side}={door_state} ({conf:.2f})  "
+              f"open_bands={len(open_bands)} close_bands={len(close_bands)} "
+              f"frames={used}")
     return C.STATUS_OK
 
+
+# -----------------------------------------------------------------------------
+# Public entry (signature preserved -- called per camera by lifecycle_runner)
+# -----------------------------------------------------------------------------
 
 def run(
     *,
@@ -527,70 +349,68 @@ def run(
     cache_root: str,
     feature_models_dir: str,
     output_dir: str,
-    evidence_root: Optional[str] = None,   # enables evidence persistence
+    evidence_root: Optional[str] = None,
     cameras: Optional[List[str]] = None,
     confidence: float = C.CONF_DOOR,
     every_nth: int = 1,
-    max_frames: int = 0,           # 0 = unbounded (legacy used the whole wagon)
+    max_frames: int = 0,
     verbose: bool = True,
 ) -> Dict[str, str]:
-    """Run the door feature per side camera, writing the per-camera layout
-    wagon_states/door/<CAMERA>/<gw>.json.  RIGHT_UP produces ONLY the right
-    door; LEFT_UP produces ONLY the left door -- so a late camera can never
-    overwrite the other side's result."""
-    del every_nth, max_frames  # kept for API symmetry; we iterate every frame
+    """Run the production door feature per side camera, writing the per-camera
+    layout ``wagon_states/door/<CAMERA>/<gw>.json``.
 
-    model_path = os.path.join(feature_models_dir, C.MODEL_DOOR_STATE)
-    yolo_model = load_yolo(model_path)
+    Signature is unchanged for the orchestrator. ``feature_models_dir``,
+    ``confidence``, ``every_nth`` and ``max_frames`` are accepted for API
+    stability but not used: the model is the PRODUCTION ``side_damage.pt``
+    (resolved via ``core.production_models``), the confidence is the production
+    per-camera value, and every interior frame is processed (as production did).
+    """
+    del feature_models_dir, confidence, every_nth, max_frames  # see docstring
 
     target_cams = [c for c in C.SIDE_CAMERAS if (cameras is None or c in cameras)]
     if not target_cams:
         return {}
+
     timer = FeatureTimer("door")
     summary: Dict[str, str] = {}
 
-    # Shared per-process helpers (loaded once across wagons + cameras)
-    illumination = IlluminationProcessor(IlluminationConfig())
-    geo_prior    = GeometricShapePrior(GeometricPriorConfig())
-    tracker_cfg  = TrackerConfig()
-    merger_cfg   = MergeConfig()
-
-    if yolo_model is None and verbose:
-        print(f"[FEAT/door] WARNING: {model_path} missing; emitting NO_DATA.")
     if verbose:
-        print(f"[FEAT/door] running on {len(state.wagons)} wagons, cameras={target_cams} "
-              f"(conf>={confidence}, legacy DoorTracker + IdentityMerger + "
-              f"GeometricPrior + IlluminationQuality)")
+        print(f"[FEAT/door] running on {len(state.wagons)} wagons, "
+              f"cameras={target_cams} (PRODUCTION side_damage.pt; "
+              f"conf right_up=0.85 left_up=0.88; band gap_tol=5)")
 
     for cam in target_cams:
         side = _SIDE_FOR_CAMERA[cam]
         feature_out = feature_camera_dir(output_dir, FEATURE_NAME, cam)
+        cam_conf = _SIDE_DOOR_CONF[cam]
+
+        # Load the PRODUCTION model (cached). Absent -> clear error -> NO_DATA.
+        model = None
+        model_err: Optional[str] = None
+        try:
+            model = PM.load_for(FEATURE_NAME, cam)
+        except PM.MissingProductionModel as e:
+            model_err = str(e)
+            if verbose:
+                print(f"[FEAT/door] {e} -- emitting NO_DATA for {cam}")
+
         for gw in state.wagons:
             gw_id = gw.global_id
             t0 = time.time()
             try:
-                if yolo_model is None:
-                    write_per_wagon_json(feature_out, gw_id, empty_payload(
-                        gw_id, FEATURE_NAME, C.NO_DATA,
-                        camera_id=cam, side=side,
-                        door_state=C.NO_DATA, door_confidence=0.0,
-                        tracks=[], supporting_cameras=[],
-                        error="door_state.pt not present",
-                    ))
+                if model is None:
+                    write_per_wagon_json(feature_out, gw_id, _empty_door_payload(
+                        gw_id, cam, side, C.NO_DATA, error=model_err))
                     summary[gw_id] = C.NO_DATA
                     continue
                 summary[gw_id] = _process_wagon_camera_door(
-                    yolo_model, illumination, geo_prior, tracker_cfg, merger_cfg,
-                    cache_root, gw, cam, feature_out, evidence_root, verbose,
-                )
+                    model, cam_conf, cache_root, gw, cam, side,
+                    feature_out, evidence_root, verbose)
             except Exception as e:
-                write_per_wagon_json(feature_out, gw_id, empty_payload(
-                    gw_id, FEATURE_NAME, C.STATUS_FAILED,
-                    camera_id=cam, side=side,
-                    door_state=C.NO_DATA,
+                write_per_wagon_json(feature_out, gw_id, _empty_door_payload(
+                    gw_id, cam, side, C.STATUS_FAILED,
                     error=f"{type(e).__name__}: {e}",
-                    traceback=traceback.format_exc(limit=2),
-                ))
+                    traceback=traceback.format_exc(limit=2)))
                 summary[gw_id] = C.STATUS_FAILED
                 if verbose:
                     print(f"  [door/{cam}/{gw_id}] FAILED: {e}")

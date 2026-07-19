@@ -18,7 +18,8 @@ Environment variables (all optional):
     WAGONEYE_WORKSPACE_ROOT     output root (default <root>/batch_outputs)
     WAGONEYE_MODELS_DIR         models root (default <root>/models)
     WAGONEYE_RECON_MODELS_DIR   reconstruction .pt dir
-    WAGONEYE_FEAT_MODELS_DIR    feature .pt dir
+    WAGONEYE_FEAT_MODELS_DIR    feature .pt dir (v4-native models; shelved for milestone 1)
+    WAGONEYE_PROD_MODELS_DIR    PRODUCTION .pt dir (milestone-1 authoritative models)
     WAGONEYE_LOCAL_INPUTS_DIR   default --local-inputs folder
     WAGONEYE_LOG_DIR            log directory (default <root>/logs)
     WAGONEYE_LOG_LEVEL          root log level (default INFO)
@@ -81,6 +82,14 @@ RECON_MODELS_DIR = _env_path("WAGONEYE_RECON_MODELS_DIR",
                              os.path.join(MODELS_DIR, "reconstruction"))
 FEAT_MODELS_DIR  = _env_path("WAGONEYE_FEAT_MODELS_DIR",
                              os.path.join(MODELS_DIR, "features"))
+# Milestone-1 authoritative models: the PRODUCTION .pt weights (side_damage,
+# top_left_damage, right_top_damage, wagon_number, ltop, top_classification).
+# These reproduce production feature behaviour exactly; the v4-native models in
+# FEAT_MODELS_DIR are shelved until the post-milestone model-swap phase. On EC2,
+# copy the production .pt files here and the pipeline runs with no code change.
+# See models/production/README.md and core/production_models.py.
+PROD_MODELS_DIR  = _env_path("WAGONEYE_PROD_MODELS_DIR",
+                             os.path.join(MODELS_DIR, "production"))
 
 WORKSPACE_ROOT   = _env_path("WAGONEYE_WORKSPACE_ROOT",
                              os.path.join(PROJECT_ROOT, "batch_outputs"))

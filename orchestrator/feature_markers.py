@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from core import camera_features as CF
+from core import production_models as PM
 
 _MARKER_ROOT = ".features"
 MARKER_SCHEMA_VERSION = 1
@@ -65,8 +66,23 @@ def compute_identity(
     *, camera_id: str, feature: str, source_key: Optional[str], etag: Optional[str],
     global_state_version: str, feat_models_dir: str, enabled: bool = True,
 ) -> Dict[str, Any]:
-    model_filename = CF.FEATURE_MODEL_FILENAME.get(feature, "")
-    model_path = os.path.join(feat_models_dir, model_filename) if model_filename else ""
+    # Marker identity keys on the PRODUCTION model actually used by the
+    # processor, resolved PER (feature, camera) via core.production_models
+    # (side_damage.pt / top_left_damage.pt / right_top_damage.pt /
+    # wagon_number.pt / ltop.pt / top_classification.pt). This supersedes the
+    # v4-native CF.FEATURE_MODEL_FILENAME mapping so a production-model swap
+    # invalidates exactly that (camera, feature) marker -- and door / ocr / load
+    # / damage all inherit the same behaviour from this one shared place.
+    # `feat_models_dir` is retained for caller compatibility but no longer
+    # selects the model. sha256_file() returns 'MISSING' when the .pt is absent
+    # (dev boxes) -> a stable identity that re-runs the feature once the real
+    # production model is staged on EC2.
+    try:
+        model_filename = PM.model_for(feature, camera_id)
+        model_path = PM.resolve(model_filename)
+    except KeyError:
+        model_filename = ""
+        model_path = ""
     return {
         "camera_id": camera_id,
         "feature": feature,

@@ -31,8 +31,11 @@ FEATURE_OCR    = "ocr"
 FEATURE_LOAD   = "load"
 FEATURE_DAMAGE = "damage"
 
-# The model file each feature loads (under models/features/).  Used to identity
-# a completion marker -- a model swap must invalidate prior results.
+# NOTE (milestone 1): completion-marker model identity is now resolved PER
+# (feature, camera) from the PRODUCTION models via core.production_models
+# (see orchestrator/feature_markers.compute_identity). This v4-native map is no
+# longer consulted for marker identity; it is retained only for reference and
+# the later per-model swap phase.
 FEATURE_MODEL_FILENAME: Dict[str, str] = {
     FEATURE_DOOR:   C.MODEL_DOOR_STATE,
     FEATURE_OCR:    C.MODEL_WAGON_ID_COUNTING,
@@ -75,6 +78,10 @@ WORK_UNITS: Tuple[CameraFeatureUnit, ...] = (
     CameraFeatureUnit(C.CAMERA_RIGHT_UP,     FEATURE_DOOR,   "right"),
     CameraFeatureUnit(C.CAMERA_RIGHT_UP,     FEATURE_OCR,    "sole"),
     CameraFeatureUnit(C.CAMERA_LEFT_UP,      FEATURE_DOOR,   "left"),
+    # Side damage: the `damage` feature also runs on the SIDE cameras
+    # (production side_damage.pt `damage` class) -> UnifiedWagonState.side_damage.
+    CameraFeatureUnit(C.CAMERA_RIGHT_UP,     FEATURE_DAMAGE, "side"),
+    CameraFeatureUnit(C.CAMERA_LEFT_UP,      FEATURE_DAMAGE, "side"),
     CameraFeatureUnit(C.CAMERA_RIGHT_UP_TOP, FEATURE_LOAD,   "primary"),
     CameraFeatureUnit(C.CAMERA_RIGHT_UP_TOP, FEATURE_DAMAGE, "primary"),
     CameraFeatureUnit(C.CAMERA_LEFT_UP_TOP,  FEATURE_LOAD,   "support"),

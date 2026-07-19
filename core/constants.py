@@ -205,8 +205,10 @@ CONF_DOOR    = 0.40
 CONF_DAMAGE  = 0.55
 CONF_OCR_BOX = 0.40
 
-# JPEG quality for materializer
-JPEG_QUALITY = 90
+# JPEG quality for materializer. q95 matches the production wagon-segment frames
+# (cv2.IMWRITE_JPEG_QUALITY, 95) so the cached frames fed to the damage/OCR
+# models are pixel-comparable to production during validation.
+JPEG_QUALITY = 95
 
 # OCR
 WAGON_NUMBER_LENGTH = 11

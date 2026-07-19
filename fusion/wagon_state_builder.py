@@ -200,6 +200,12 @@ def _fuse_camera_scoped(
     _apply("wagon_identifier", C.CAMERA_RIGHT_UP, CF.FEATURE_OCR, ocr,
            "wagon_identifier", "wagon_identifier_confidence",
            "wagon_identifier_confidence")
+    # loco number (5-digit, ENGINE wagons) rides along with RIGHT_UP OCR.
+    if _is_ok(ocr) and ocr.get("loco_number") not in (None, C.NO_DATA):
+        u.loco_number = str(ocr["loco_number"])
+        u.loco_number_confidence = float(ocr.get("loco_number_confidence", 0.0) or 0.0)
+        u.field_sources["loco_number"] = C.CAMERA_RIGHT_UP
+        u.field_status["loco_number"] = ResultState.OK
 
     # ---- Doors: right <- RIGHT_UP, left <- LEFT_UP ----
     dr = _cam_json(states_root, CF.FEATURE_DOOR, C.CAMERA_RIGHT_UP, gw_id)
@@ -270,9 +276,40 @@ def _fuse_camera_scoped(
                 present(C.CAMERA_RIGHT_UP_TOP), missing_final(C.CAMERA_RIGHT_UP_TOP),
                 _cam_json(states_root, CF.FEATURE_DAMAGE, C.CAMERA_RIGHT_UP_TOP, gw_id))
 
-    # side_damage: reserved (no feature); mark disabled if damage disabled else NO_DATA
-    u.field_sources["side_damage"] = C.CAMERA_LEFT_UP
-    u.field_status["side_damage"] = C.NO_DATA
+    # ---- Side damage: DAMAGE if EITHER side camera reports confirmed damage ----
+    # (production side_damage.pt `damage` class; the `damage` feature run on the
+    # side cameras). Mirrors the top-damage authority pattern.
+    if CF.FEATURE_DAMAGE in disabled_features:
+        u.side_damage = C.DISABLED_DISPLAY
+        u.field_sources["side_damage"] = C.CAMERA_RIGHT_UP
+        u.field_status["side_damage"] = ResultState.DISABLED_BY_USER
+    else:
+        side_details: List[Dict[str, Any]] = []
+        side_damaged_cam = None
+        side_any_ok = False
+        for cam in C.SIDE_CAMERAS:
+            sj = _cam_json(states_root, CF.FEATURE_DAMAGE, cam, gw_id)
+            if _is_ok(sj):
+                side_any_ok = True
+                if sj.get("damage_status") == C.DAMAGE_PRESENT:
+                    side_damaged_cam = side_damaged_cam or cam
+                    side_details.extend(sj.get("side_damage_details") or [])
+                if present(cam):
+                    supporting.add(cam)
+        if side_damaged_cam is not None:
+            u.side_damage = C.DAMAGE_PRESENT
+            u.side_damage_details = side_details
+            u.field_sources["side_damage"] = side_damaged_cam
+            u.field_status["side_damage"] = ResultState.OK
+        elif side_any_ok:
+            u.side_damage = C.DAMAGE_OK
+            u.field_sources["side_damage"] = C.CAMERA_RIGHT_UP
+            u.field_status["side_damage"] = ResultState.OK
+        else:
+            u.field_sources["side_damage"] = C.CAMERA_RIGHT_UP
+            u.field_status["side_damage"] = _result_state(
+                present(C.CAMERA_RIGHT_UP), missing_final(C.CAMERA_RIGHT_UP),
+                _cam_json(states_root, CF.FEATURE_DAMAGE, C.CAMERA_RIGHT_UP, gw_id))
 
     # ---- Provenance + camera status ----
     u.supporting_cameras = sorted(supporting)
@@ -305,6 +342,9 @@ def _fuse_flat(gw: GlobalWagon, states_root: str, *,
     if _is_ok(ocr) and ocr.get("wagon_identifier") not in (None, C.NO_DATA):
         u.wagon_identifier = str(ocr["wagon_identifier"])
         u.wagon_identifier_confidence = float(ocr.get("wagon_identifier_confidence", 0.0) or 0.0)
+    if _is_ok(ocr) and ocr.get("loco_number") not in (None, C.NO_DATA):
+        u.loco_number = str(ocr["loco_number"])
+        u.loco_number_confidence = float(ocr.get("loco_number_confidence", 0.0) or 0.0)
     if _is_ok(door):
         if door.get("left_door") not in (None, C.NO_DATA):
             u.left_door = str(door["left_door"])

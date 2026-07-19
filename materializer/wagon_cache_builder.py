@@ -50,7 +50,9 @@ log = get_logger("materializer")
 
 # Bump when the on-disk cache layout / extraction semantics change so stale
 # caches from an older materializer are rebuilt rather than reused.
-MATERIALIZER_SCHEMA_VERSION = 1
+# v2: JPEG quality raised q90 -> q95 (production parity); older q90 caches must
+# be re-materialized so validation compares like-for-like pixels.
+MATERIALIZER_SCHEMA_VERSION = 2
 _MARKER_DIR = ".materialized"
 
 

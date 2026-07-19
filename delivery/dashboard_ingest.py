@@ -453,8 +453,26 @@ def build_inspection_json(*, camera: str, report_doc: Dict[str, Any],
     else:
         damaged_count = 0
 
-    degraded = ["direction", "loco_frames", "loco_number_results",
-                "total_loco_frames"]
+    # Loco numbers (5-digit): production emitted them on RIGHT_UP only, keyed by
+    # loco_id. Re-derived here from the fused ENGINE-wagon loco_number values.
+    loco_number_results: Dict[str, Any] = {}
+    if camera == C.CAMERA_RIGHT_UP:
+        _loco_id = 0
+        for w in wagons:
+            _ln = w.get("loco_number") or C.NO_DATA
+            if _ln not in (None, "", C.NO_DATA):
+                _loco_id += 1
+                _digits = re.sub(r"[^0-9]", "", str(_ln))
+                loco_number_results[str(_loco_id)] = {
+                    "is_valid_5_digit": len(_digits) == 5,
+                    "display_number": str(_ln),
+                    "raw_number": str(_ln),
+                    "confidence": float(w.get("loco_number_confidence", 0.0) or 0.0),
+                }
+
+    degraded = ["direction", "loco_frames", "total_loco_frames"]
+    if not loco_number_results:
+        degraded.append("loco_number_results")
     if not is_top and not side:
         degraded.append("doors_open/doors_closed")
 
@@ -478,7 +496,7 @@ def build_inspection_json(*, camera: str, report_doc: Dict[str, Any],
         "total_problem_frames": len(problem_frames),
         "problem_frames_by_type": pf_type_counts,
         "wagon_number_results": wagon_number_results,
-        "loco_number_results": {},                    # DEGRADED
+        "loco_number_results": loco_number_results,   # RIGHT_UP: 5-digit loco numbers
         "segment_type_map": segment_type_map,
         "wagon_segments": wagon_segments,
         "loco_frames": [],                            # DEGRADED
