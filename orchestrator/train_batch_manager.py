@@ -104,17 +104,43 @@ def save_batch_state(s3_client, state_loc: str, processed: Dict[str, str]) -> No
 # S3 listing + camera / timestamp resolution
 # -----------------------------------------------------------------------------
 
-def _camera_for_key(key: str) -> Optional[str]:
-    """Match an S3 key's basename to a camera id by substring.
+# Camera-identifying tokens as they appear in a full S3 KEY (folder and/or
+# filename).  Each camera's canonical id PLUS the station's actual S3 folder
+# token: the TWO TOP cameras live under camera_CCTV_HZBN_DHN_5_RIGHT_TOP /
+# ..._6_LEFT_TOP -- token "right_top" / "left_top", which does NOT contain the
+# canonical "right_up_top" / "left_up_top".  Matching only the canonical id (the
+# previous behaviour) left every top-camera object unclassifiable, so only the
+# two SIDE cameras ever formed a batch.  A side token can never appear inside a
+# top folder token or vice-versa, so the mapping is unambiguous.
+_CAMERA_KEY_TOKENS = {
+    C.CAMERA_RIGHT_UP_TOP: ("right_up_top", "right_top"),
+    C.CAMERA_LEFT_UP_TOP:  ("left_up_top", "left_top"),
+    C.CAMERA_RIGHT_UP:     ("right_up",),
+    C.CAMERA_LEFT_UP:      ("left_up",),
+}
 
-    Longest camera name first so RIGHT_UP_TOP wins over RIGHT_UP -- identical
-    disambiguation to core.batch.scan_local_video_dir.
+# TOP cameras first: their tokens are the most specific ("right_up" is a
+# substring of "right_up_top", so the top camera must win when both could match).
+_CAMERA_MATCH_ORDER = (
+    C.CAMERA_RIGHT_UP_TOP, C.CAMERA_LEFT_UP_TOP,
+    C.CAMERA_RIGHT_UP, C.CAMERA_LEFT_UP,
+)
+
+
+def _camera_for_key(key: str) -> Optional[str]:
+    """Identify the camera from a FULL S3 key (folder + filename).
+
+    Matches the whole key -- not just the basename -- so the camera folder
+    ``camera_CCTV_HZBN_DHN_<n>_<ANGLE>/`` participates in identification, and
+    recognises the TOP cameras' folder token (``right_top`` / ``left_top``) in
+    addition to the canonical id.  Returns None only when no camera token is
+    present anywhere in the key.
     """
-    base = key.rsplit("/", 1)[-1].lower()
-    if not base.endswith(_VIDEO_EXTS):
+    k = key.lower()
+    if not k.endswith(_VIDEO_EXTS):
         return None
-    for cam in sorted(C.ALL_CAMERAS, key=len, reverse=True):
-        if cam.lower() in base:
+    for cam in _CAMERA_MATCH_ORDER:
+        if any(tok in k for tok in _CAMERA_KEY_TOKENS[cam]):
             return cam
     return None
 
@@ -176,8 +202,21 @@ def list_candidate_videos(s3_client) -> List[CameraVideo]:
     for bucket, key, last_modified, etag in _list_input_objects(s3_client):
         cam = _camera_for_key(key)
         ts = parse_train_timestamp(key)
+        # Print EVERY discovered object with its parsed camera + timestamp +
+        # batch id, and the exact reason when it is ignored (previously top-camera
+        # objects were dropped here silently).
         if not cam or not ts:
+            reasons = []
+            if not cam:
+                reasons.append("no_camera_match")
+            if not ts:
+                reasons.append("no_timestamp")
+            log.info("[DISCOVERY] key=%s ts=%s camera=%s batch=%s decision=DROPPED "
+                     "reason=%s", key, ts or "-", cam or "-", ts or "-",
+                     "+".join(reasons))
             continue
+        log.info("[DISCOVERY] key=%s ts=%s camera=%s batch=%s decision=CLASSIFIED",
+                 key, ts, cam, ts)
         out.append(CameraVideo(
             camera_id=cam, bucket=bucket, s3_key=key,
             filename=key.rsplit("/", 1)[-1],

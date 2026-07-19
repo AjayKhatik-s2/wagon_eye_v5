@@ -648,6 +648,11 @@ def advance(manifest: BatchManifest, ctx: RunContext) -> BatchManifest:
         if st in (LifecycleState.DISCOVERED, LifecycleState.COLLECTING_CAMERAS,
                   LifecycleState.WAITING_FOR_MASTER, LifecycleState.WAITING_FOR_SUPPORT):
             master = _choose_master(manifest)
+            log.info("[PRESEAL %s] state=%s present=%s master=%s complete=%s "
+                     "past_support=%s past_master=%s past_final=%s",
+                     manifest.batch_key, st, manifest.present_cameras(), master,
+                     manifest.is_complete(), manifest.past_support_window(),
+                     manifest.past_master_deadline(), manifest.past_final_deadline())
             if master == C.MASTER_CAMERA:
                 # RIGHT_UP present: wait for the short support window (unless all
                 # support already here), then seal -- never wait for final. [C3]
@@ -687,6 +692,13 @@ def advance(manifest: BatchManifest, ctx: RunContext) -> BatchManifest:
         if st == LifecycleState.PROCESSING_AVAILABLE:
             stage_process_cameras(manifest, ctx, cameras=manifest.present_cameras())
             stage_reports(manifest, ctx, final=False)
+            log.info("[POSTSEAL %s] processed present=%s missing=%s complete=%s "
+                     "past_final=%s -> %s", manifest.batch_key,
+                     manifest.present_cameras(), manifest.missing_cameras(),
+                     manifest.is_complete(), manifest.past_final_deadline(),
+                     ("FINALIZING" if (manifest.is_complete()
+                                       or manifest.past_final_deadline())
+                      else "WAITING_FOR_LATE_CAMERAS"))
             if manifest.is_complete() or manifest.past_final_deadline():
                 _transition(manifest, LifecycleState.FINALIZING, ctx,
                             reason=("complete" if manifest.is_complete()

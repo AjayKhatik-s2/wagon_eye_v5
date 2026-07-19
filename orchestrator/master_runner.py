@@ -627,6 +627,19 @@ def _attach_candidate(cv, actives, processed, ctx, tolerance_sec):
             scored.append((dist, m))
     scored.sort(key=lambda x: (x[0], x[1].batch_key))
 
+    # Full grouping-decision trace: which active batches are within the match
+    # window for this candidate, and whether a TERMINAL batch is also in range
+    # (the latter is what produces "matches terminal batch -- ignored").
+    terminal_in_range = [
+        key for key in processed
+        if _canonical_dt(key) is not None
+        and abs((cand_dt - _canonical_dt(key)).total_seconds()) <= tolerance_sec
+    ]
+    log.info("[GROUPING] camera=%s ts=%s key=%s tolerance=%ds "
+             "active_in_range=%s terminal_in_range=%s",
+             cv.camera_id, cv.train_timestamp, cv.s3_key, int(tolerance_sec),
+             [(m.batch_key, round(d, 1)) for d, m in scored], terminal_in_range)
+
     target = None
     if scored:
         if len(scored) >= 2 and (scored[1][0] - scored[0][0]) < _ATTACH_AMBIGUITY_SEC:
@@ -676,6 +689,10 @@ def _attach_candidate(cv, actives, processed, ctx, tolerance_sec):
                        and hasattr(cv.last_modified, "isoformat") else None),
     )
     target.set_camera(new_slot)
+    attached = sorted(target.cameras.keys())
+    log.info("[ATTACH] batch=%s camera=%s ts=%s decision=ATTACHED cameras=%d/%d %s",
+             target.batch_key, cv.camera_id, cv.train_timestamp,
+             len(attached), len(C.ALL_CAMERAS), attached)
     BM.write_local(target, os.path.join(ctx.workspace_root, target.batch_key))
     BM.save_s3(ctx.s3_client, target)
 
