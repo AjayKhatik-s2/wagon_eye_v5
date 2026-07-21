@@ -614,6 +614,11 @@ def _attach_candidate(cv, actives, processed, ctx, tolerance_sec):
 
     cand_dt = _canonical_dt(cv.train_timestamp)
     if cand_dt is None:
+        # SILENT-DROP guard made loud: the regex accepted the stamp but
+        # strptime("%Y%m%d_%H%M%S") rejected it -> this camera never attaches.
+        log.warning("[ATTACH] camera=%s ts=%s key=%s decision=DROPPED "
+                    "reason=timestamp_unparseable_by_canonical_dt",
+                    cv.camera_id, cv.train_timestamp, cv.s3_key)
         return
 
     # rank active manifests by temporal distance
@@ -655,6 +660,10 @@ def _attach_candidate(cv, actives, processed, ctx, tolerance_sec):
             BM.save_s3(ctx.s3_client, best)
             return
         target = scored[0][1]
+        log.info("[ATTACH] camera=%s ts=%s decision=JOIN batch=%s dist=%.1fs "
+                 "(nearest of %d active-in-range within %ds)",
+                 cv.camera_id, cv.train_timestamp, target.batch_key,
+                 scored[0][0], len(scored), int(tolerance_sec))
 
     if target is None:
         # terminal batch within tolerance? -> ignore (no silent reopen)
@@ -674,6 +683,8 @@ def _attach_candidate(cv, actives, processed, ctx, tolerance_sec):
 
     slot = target.cameras.get(cv.camera_id)
     if slot is not None and slot.arrival_state == ArrivalState.PRESENT and slot.etag == cv.etag:
+        log.info("[ATTACH] batch=%s camera=%s decision=SKIP "
+                 "reason=already_present_same_etag", target.batch_key, cv.camera_id)
         return  # already have this exact source version
     if slot is not None and slot.etag and slot.etag != cv.etag:
         log.info("[ATTACH] %s/%s ETag changed %s -> %s: rebuild that camera",

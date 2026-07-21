@@ -205,24 +205,29 @@ def list_candidate_videos(s3_client) -> List[CameraVideo]:
     each candidate to an active batch (or creates one).  Unclassifiable objects
     are dropped."""
     out: List[CameraVideo] = []
+    n_seen = 0
     for bucket, key, last_modified, etag in _list_input_objects(s3_client):
+        n_seen += 1
         cam = _camera_for_key(key)
         ts = parse_train_timestamp(key)
-        # Print EVERY discovered object with its parsed camera + timestamp +
-        # batch id, and the exact reason when it is ignored (previously top-camera
-        # objects were dropped here silently).
+        prefix = key.rsplit("/", 1)[0] + "/" if "/" in key else "(root)"
+        lm = getattr(last_modified, "isoformat", lambda: str(last_modified))()
+        # Print EVERY discovered object with bucket/prefix/key/camera/timestamp/
+        # batch id/etag/last_modified, and the exact reason when it is ignored.
         if not cam or not ts:
             reasons = []
             if not cam:
                 reasons.append("no_camera_match")
             if not ts:
                 reasons.append("no_timestamp")
-            log.info("[DISCOVERY] key=%s ts=%s camera=%s batch=%s decision=DROPPED "
-                     "reason=%s", key, ts or "-", cam or "-", ts or "-",
-                     "+".join(reasons))
+            log.warning("[DISCOVERY] bucket=%s prefix=%s key=%s camera=%s ts=%s "
+                        "batch=%s etag=%s last_modified=%s decision=DROPPED reason=%s",
+                        bucket, prefix, key, cam or "-", ts or "-", ts or "-",
+                        etag or "-", lm, "+".join(reasons))
             continue
-        log.info("[DISCOVERY] key=%s ts=%s camera=%s batch=%s decision=CLASSIFIED",
-                 key, ts, cam, ts)
+        log.info("[DISCOVERY] bucket=%s prefix=%s key=%s camera=%s ts=%s batch=%s "
+                 "etag=%s last_modified=%s decision=CLASSIFIED",
+                 bucket, prefix, key, cam, ts, ts, etag or "-", lm)
         out.append(CameraVideo(
             camera_id=cam, bucket=bucket, s3_key=key,
             filename=key.rsplit("/", 1)[-1],
@@ -231,6 +236,13 @@ def list_candidate_videos(s3_client) -> List[CameraVideo]:
         ))
     # deterministic order: timestamp, camera, key
     out.sort(key=lambda cv: (cv.train_timestamp, cv.camera_id, cv.s3_key))
+    by_cam: Dict[str, int] = {}
+    for cv in out:
+        by_cam[cv.camera_id] = by_cam.get(cv.camera_id, 0) + 1
+    missing = [c for c in C.ALL_CAMERAS if c not in by_cam]
+    log.info("[DISCOVERY] summary: listed_objects=%d classified=%d per_camera=%s "
+             "NOT_CLASSIFIED_CAMERAS=%s", n_seen, len(out), by_cam,
+             missing or "none")
     return out
 
 

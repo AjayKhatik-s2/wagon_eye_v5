@@ -648,17 +648,31 @@ def advance(manifest: BatchManifest, ctx: RunContext) -> BatchManifest:
         if st in (LifecycleState.DISCOVERED, LifecycleState.COLLECTING_CAMERAS,
                   LifecycleState.WAITING_FOR_MASTER, LifecycleState.WAITING_FOR_SUPPORT):
             master = _choose_master(manifest)
-            log.info("[PRESEAL %s] state=%s present=%s master=%s complete=%s "
-                     "past_support=%s past_master=%s past_final=%s",
-                     manifest.batch_key, st, manifest.present_cameras(), master,
-                     manifest.is_complete(), manifest.past_support_window(),
-                     manifest.past_master_deadline(), manifest.past_final_deadline())
+            _now = BM.iso(BM._now())
+            log.info("[PRESEAL %s] state=%s present=%s missing=%s expected=%s "
+                     "master=%s complete=%s | now=%s master_deadline=%s "
+                     "support_deadline=%s final_deadline=%s | "
+                     "past_master=%s past_support=%s past_final=%s",
+                     manifest.batch_key, st, manifest.present_cameras(),
+                     manifest.missing_cameras(), list(C.ALL_CAMERAS), master,
+                     manifest.is_complete(), _now, manifest.master_deadline,
+                     manifest.support_fusion_deadline, manifest.final_camera_deadline,
+                     manifest.past_master_deadline(), manifest.past_support_window(),
+                     manifest.past_final_deadline())
             if master == C.MASTER_CAMERA:
                 # RIGHT_UP present: wait for the short support window (unless all
                 # support already here), then seal -- never wait for final. [C3]
                 if manifest.is_complete() or manifest.past_support_window():
+                    reason = ("all_cameras_present" if manifest.is_complete()
+                              else "support_window_expired (sealing with present "
+                                   "cameras only; missing=%s)" % manifest.missing_cameras())
+                    log.info("[SEAL-DECISION %s] -> RECONSTRUCTING reason=%s present=%s",
+                             manifest.batch_key, reason, manifest.present_cameras())
                     _transition(manifest, LifecycleState.RECONSTRUCTING, ctx)
                     continue
+                log.info("[SEAL-DECISION %s] -> WAITING_FOR_SUPPORT reason=RIGHT_UP "
+                         "present, support window still open, waiting for missing=%s",
+                         manifest.batch_key, manifest.missing_cameras())
                 _transition(manifest, LifecycleState.WAITING_FOR_SUPPORT, ctx)
                 return manifest
             # RIGHT_UP absent
