@@ -231,6 +231,18 @@ AUTO_RUN_EXTRACTION = _env_bool("WAGONEYE_AUTO_RUN_EXTRACTION", False)
 # Set false to require models to be pre-staged on disk (the pre-sync behaviour).
 MODEL_SYNC_ENABLED = _env_bool("WAGONEYE_MODEL_SYNC_ENABLED", True)
 
+# Feature-inference batch size (performance).  DEFAULT 32: batched YOLO
+# inference (collect frames -> model([...]) -> scatter) is ON by default on this
+# optimization branch for maximum Stage-3 throughput.  On any out-of-memory
+# condition the batch auto-halves 32->16->8->4->2->1 (sticky, process-wide) and
+# retries -- it never fails on OOM.
+# Set WAGONEYE_FEATURE_BATCH_SIZE=1 to fall back to the exact per-frame path
+# (byte-identical to the pre-optimization behaviour).  NOTE: batched inference is
+# NOT guaranteed bit-identical to per-frame at hard confidence-threshold
+# boundaries (batched GEMM/FP16 reduction order) -- validate output parity on the
+# target host with the production models (see docs/PERFORMANCE_STAGE3_OPTIMIZATION.md).
+FEATURE_BATCH_SIZE = max(1, int(_env_float("WAGONEYE_FEATURE_BATCH_SIZE", 32)))
+
 
 # -----------------------------------------------------------------------------
 # Startup configuration validation + redacted summary
@@ -322,10 +334,20 @@ def startup_summary(*, mode: str) -> str:
         f"  model_sync_enabled       : {MODEL_SYNC_ENABLED} (bucket={C.S3_MODELS_BUCKET})",
         f"  poll_interval_s          : {ACTIVE_BATCH_POLL_INTERVAL}",
         f"  s3_raw_bucket            : {C.S3_RAW_BUCKET}",
-        f"  s3_trimmed_bucket        : {C.S3_TRIMMED_BUCKET}",
+        f"  s3_trimmed_bucket        : {C.S3_TRIMMED_BUCKET}"
+        + ("  <-- SET BY env WAGONEYE_S3_TRIMMED_BUCKET"
+           if os.getenv("WAGONEYE_S3_TRIMMED_BUCKET") else "  (default)"),
         f"  s3_output_bucket         : {C.S3_OUTPUT_BUCKET}",
-        f"  s3_input_bucket          : {C.S3_INPUT_BUCKET}",
-        f"  s3_input_prefixes        : {len(C.S3_INPUT_PREFIXES)} configured",
+        # Provenance of the DISCOVERY source, so a stale env override is obvious:
+        f"  s3_input_bucket          : {C.S3_INPUT_BUCKET}"
+        + ("  <-- OVERRIDDEN by env WAGONEYE_S3_INPUT_BUCKET"
+           if os.getenv("WAGONEYE_S3_INPUT_BUCKET")
+           else ("  <-- inherited from env WAGONEYE_S3_TRIMMED_BUCKET"
+                 if os.getenv("WAGONEYE_S3_TRIMMED_BUCKET")
+                 else "  (built-in default)")),
+        f"  s3_input_prefixes        : {len(C.S3_INPUT_PREFIXES)} configured"
+        + ("  <-- OVERRIDDEN by env WAGONEYE_S3_INPUT_PREFIXES"
+           if os.getenv("WAGONEYE_S3_INPUT_PREFIXES") else "  (built-in default)"),
         f"  s3_output_prefixes       : reports={C.S3_REPORTS_PREFIX} "
         f"dashboard={C.S3_DASHBOARD_PREFIX} archive={C.S3_ARCHIVE_PREFIX}",
         f"  s3_state_key             : {C.S3_STATE_KEY}",

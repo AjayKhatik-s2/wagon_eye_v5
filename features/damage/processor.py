@@ -43,12 +43,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 
 from core import constants as C
+from core import config as CFG
 from core import production_models as PM
 from core.global_state_loader import GlobalTrainState
 
 from features._common import (
     list_wagon_frames, write_per_wagon_json, empty_payload,
-    FeatureTimer, feature_camera_dir, DEVICE, HALF,
+    FeatureTimer, feature_camera_dir, DEVICE, HALF, batched_detect,
 )
 from features._evidence import (
     atomic_camera_evidence, read_cached_frame,
@@ -134,6 +135,72 @@ def _analyze_bands(
     return bands
 
 
+def _collect_top_batched(model, interior, dets_by_class):
+    """OPT-IN batched top-damage collection (FEATURE_BATCH_SIZE>1): decode in
+    chunks, batched inference, cache decoded frames that carried a detection for
+    evidence reuse.  Produces the SAME per-class (frame,conf,bbox) records as the
+    per-frame path."""
+    used = 0
+    frame_cache: Dict[int, Any] = {}
+    bs = CFG.FEATURE_BATCH_SIZE
+    for j in range(0, len(interior), bs):
+        fis: List[int] = []
+        frames: List[Any] = []
+        for p in interior[j:j + bs]:
+            fr = cv2.imread(p)
+            if fr is None:
+                continue
+            fis.append(_parse_frame_index(p))
+            frames.append(fr)
+        if not frames:
+            continue
+        used += len(frames)
+        per = batched_detect(model, frames, confidence=_DAMAGE_CONFIDENCE)
+        for fi, fr, dets in zip(fis, frames, per):
+            hit = False
+            for d in dets:
+                cname = d["class_name"]
+                if cname not in dets_by_class:
+                    continue
+                dets_by_class[cname].append(
+                    (fi, d["confidence"], d["bbox"][0], d["bbox"][1],
+                     d["bbox"][2], d["bbox"][3]))
+                hit = True
+            if hit:
+                frame_cache[fi] = fr
+    return used, frame_cache
+
+
+def _collect_side_batched(model, cam_conf, interior, dmg_dets, side_class):
+    """OPT-IN batched side-damage collection (FEATURE_BATCH_SIZE>1)."""
+    used = 0
+    frame_cache: Dict[int, Any] = {}
+    bs = CFG.FEATURE_BATCH_SIZE
+    for j in range(0, len(interior), bs):
+        fis: List[int] = []
+        frames: List[Any] = []
+        for p in interior[j:j + bs]:
+            fr = cv2.imread(p)
+            if fr is None:
+                continue
+            fis.append(_parse_frame_index(p))
+            frames.append(fr)
+        if not frames:
+            continue
+        used += len(frames)
+        per = batched_detect(model, frames, confidence=cam_conf)
+        for fi, fr, dets in zip(fis, frames, per):
+            hit = False
+            for d in dets:
+                if d["class_name"] == side_class:
+                    dmg_dets.append((fi, d["confidence"], d["bbox"][0], d["bbox"][1],
+                                     d["bbox"][2], d["bbox"][3]))
+                    hit = True
+            if hit:
+                frame_cache[fi] = fr
+    return used, frame_cache
+
+
 def _process_wagon_camera_damage(
     model, cache_root: str, gw, camera_id: str, feature_out: str,
     evidence_root: Optional[str], verbose: bool,
@@ -152,34 +219,39 @@ def _process_wagon_camera_damage(
     paths = list_wagon_frames(cache_root, gw_id, camera_id)
     interior = _interior_frames(paths)
     used = 0
+    frame_cache: Dict[int, Any] = {}
     names = getattr(model, "names", {}) or {}
     dets_by_class: Dict[str, List[Tuple[int, float, float, float, float, float]]] = {
         c: [] for c in _TOP_CLASSES
     }
 
-    for p in interior:
-        frame = cv2.imread(p)
-        if frame is None:
-            continue
-        used += 1
-        fi = _parse_frame_index(p)
-        try:
-            res = model(frame, verbose=False, half=HALF, device=DEVICE,
-                        conf=_DAMAGE_CONFIDENCE)[0]
-        except Exception:
-            continue
-        if res.boxes is None or len(res.boxes) == 0:
-            continue
-        boxes = res.boxes.xyxy.cpu().numpy()
-        confs = res.boxes.conf.cpu().numpy()
-        clss = res.boxes.cls.cpu().numpy().astype(int)
-        for bbox, conf, cid in zip(boxes, confs, clss):
-            cname = str(names.get(int(cid), "")).lower()
-            if cname not in dets_by_class:
+    if CFG.FEATURE_BATCH_SIZE > 1:
+        used, frame_cache = _collect_top_batched(model, interior, dets_by_class)
+    else:
+        # === DEFAULT per-frame path -- VERBATIM pre-optimization behaviour ===
+        for p in interior:
+            frame = cv2.imread(p)
+            if frame is None:
                 continue
-            dets_by_class[cname].append(
-                (fi, float(conf), float(bbox[0]), float(bbox[1]),
-                 float(bbox[2]), float(bbox[3])))
+            used += 1
+            fi = _parse_frame_index(p)
+            try:
+                res = model(frame, verbose=False, half=HALF, device=DEVICE,
+                            conf=_DAMAGE_CONFIDENCE)[0]
+            except Exception:
+                continue
+            if res.boxes is None or len(res.boxes) == 0:
+                continue
+            boxes = res.boxes.xyxy.cpu().numpy()
+            confs = res.boxes.conf.cpu().numpy()
+            clss = res.boxes.cls.cpu().numpy().astype(int)
+            for bbox, conf, cid in zip(boxes, confs, clss):
+                cname = str(names.get(int(cid), "")).lower()
+                if cname not in dets_by_class:
+                    continue
+                dets_by_class[cname].append(
+                    (fi, float(conf), float(bbox[0]), float(bbox[1]),
+                     float(bbox[2]), float(bbox[3])))
 
     if used == 0:
         write_per_wagon_json(feature_out, gw_id, empty_payload(
@@ -225,8 +297,12 @@ def _process_wagon_camera_damage(
                 "camera_id": camera_id, "detections": details,
             })
             for i, d in enumerate(details, start=1):
-                frame = read_cached_frame(cache_root, gw_id,
-                                          C.CAMERA_FOLDER[camera_id], d["best_frame_idx"])
+                # Reuse the already-decoded frame from the batched path (identical
+                # bytes); default path has an empty cache -> original re-read.
+                frame = frame_cache.get(d["best_frame_idx"])
+                if frame is None:
+                    frame = read_cached_frame(cache_root, gw_id,
+                                              C.CAMERA_FOLDER[camera_id], d["best_frame_idx"])
                 if frame is None:
                     continue
                 annotated = draw_annotated_bbox(
@@ -293,28 +369,34 @@ def _process_wagon_camera_side_damage(
     paths = list_wagon_frames(cache_root, gw_id, camera_id)
     interior = _interior_frames(paths)
     used = 0
+    frame_cache: Dict[int, Any] = {}
     names = getattr(model, "names", {}) or {}
     dmg_dets: List[Tuple[int, float, float, float, float, float]] = []
 
-    for p in interior:
-        frame = cv2.imread(p)
-        if frame is None:
-            continue
-        used += 1
-        fi = _parse_frame_index(p)
-        try:
-            res = model(frame, verbose=False, half=HALF, device=DEVICE, conf=cam_conf)[0]
-        except Exception:
-            continue
-        if res.boxes is None or len(res.boxes) == 0:
-            continue
-        boxes = res.boxes.xyxy.cpu().numpy()
-        confs = res.boxes.conf.cpu().numpy()
-        clss = res.boxes.cls.cpu().numpy().astype(int)
-        for bbox, conf, cid in zip(boxes, confs, clss):
-            if str(names.get(int(cid), "")).lower() == _CLASS_SIDE_DAMAGE:
-                dmg_dets.append((fi, float(conf), float(bbox[0]), float(bbox[1]),
-                                 float(bbox[2]), float(bbox[3])))
+    if CFG.FEATURE_BATCH_SIZE > 1:
+        used, frame_cache = _collect_side_batched(
+            model, cam_conf, interior, dmg_dets, _CLASS_SIDE_DAMAGE)
+    else:
+        # === DEFAULT per-frame path -- VERBATIM pre-optimization behaviour ===
+        for p in interior:
+            frame = cv2.imread(p)
+            if frame is None:
+                continue
+            used += 1
+            fi = _parse_frame_index(p)
+            try:
+                res = model(frame, verbose=False, half=HALF, device=DEVICE, conf=cam_conf)[0]
+            except Exception:
+                continue
+            if res.boxes is None or len(res.boxes) == 0:
+                continue
+            boxes = res.boxes.xyxy.cpu().numpy()
+            confs = res.boxes.conf.cpu().numpy()
+            clss = res.boxes.cls.cpu().numpy().astype(int)
+            for bbox, conf, cid in zip(boxes, confs, clss):
+                if str(names.get(int(cid), "")).lower() == _CLASS_SIDE_DAMAGE:
+                    dmg_dets.append((fi, float(conf), float(bbox[0]), float(bbox[1]),
+                                     float(bbox[2]), float(bbox[3])))
 
     if used == 0:
         write_per_wagon_json(feature_out, gw_id, empty_payload(
@@ -342,8 +424,10 @@ def _process_wagon_camera_side_damage(
                 "global_id": gw_id, "feature": FEATURE_NAME, "camera_id": camera_id,
                 "side": True, "detections": details})
             for i, d in enumerate(details, start=1):
-                frame = read_cached_frame(cache_root, gw_id, C.CAMERA_FOLDER[camera_id],
-                                          d["best_frame_idx"])
+                frame = frame_cache.get(d["best_frame_idx"])
+                if frame is None:
+                    frame = read_cached_frame(cache_root, gw_id, C.CAMERA_FOLDER[camera_id],
+                                              d["best_frame_idx"])
                 if frame is None:
                     continue
                 annotated = draw_annotated_bbox(

@@ -50,12 +50,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 
 from core import constants as C
+from core import config as CFG
 from core import production_models as PM
 from core.global_state_loader import GlobalTrainState
 
 from features._common import (
     list_wagon_frames, write_per_wagon_json, feature_camera_dir,
-    FeatureTimer, DEVICE, HALF,
+    FeatureTimer, DEVICE, HALF, batched_detect,
 )
 from features._evidence import (
     atomic_camera_evidence, read_cached_frame,
@@ -212,6 +213,49 @@ def _bands_to_tracks(
 
 
 # -----------------------------------------------------------------------------
+# Detection collection (default per-frame == byte-identical; batched == opt-in)
+# -----------------------------------------------------------------------------
+
+def _collect_door_batched(model, cam_conf, interior):
+    """OPT-IN batched collection (FEATURE_BATCH_SIZE>1): decode in chunks, run
+    batched inference, and cache decoded frames that carried a door detection so
+    evidence reuses them (no re-read).  Produces the SAME (frame,conf,bbox)
+    records as the per-frame path; enable only after on-host parity validation."""
+    names = getattr(model, "names", {}) or {}
+    open_dets: List[Tuple[int, float, float, float, float, float]] = []
+    close_dets: List[Tuple[int, float, float, float, float, float]] = []
+    used = 0
+    frame_cache: Dict[int, Any] = {}
+    bs = CFG.FEATURE_BATCH_SIZE
+    for j in range(0, len(interior), bs):
+        fis: List[int] = []
+        frames: List[Any] = []
+        for p in interior[j:j + bs]:
+            fr = cv2.imread(p)
+            if fr is None:
+                continue
+            fis.append(_parse_frame_index(p))
+            frames.append(fr)
+        if not frames:
+            continue
+        used += len(frames)
+        per = batched_detect(model, frames, confidence=cam_conf)
+        for fi, fr, dets in zip(fis, frames, per):
+            hit = False
+            for d in dets:
+                cname = d["class_name"]
+                rec = (fi, d["confidence"], d["bbox"][0], d["bbox"][1],
+                       d["bbox"][2], d["bbox"][3])
+                if cname == _CLASS_DOOR_OPEN:
+                    open_dets.append(rec); hit = True
+                elif cname == _CLASS_DOOR_CLOSE:
+                    close_dets.append(rec); hit = True
+            if hit:
+                frame_cache[fi] = fr
+    return open_dets, close_dets, used, frame_cache
+
+
+# -----------------------------------------------------------------------------
 # Per-wagon, per-camera door pass
 # -----------------------------------------------------------------------------
 
@@ -230,34 +274,40 @@ def _process_wagon_camera_door(
     open_dets: List[Tuple[int, float, float, float, float, float]] = []
     close_dets: List[Tuple[int, float, float, float, float, float]] = []
     used = 0
+    frame_cache: Dict[int, Any] = {}
     names = getattr(model, "names", {}) or {}
 
-    for p in interior:
-        frame = cv2.imread(p)
-        if frame is None:
-            continue
-        used += 1
-        fi = _parse_frame_index(p)
-        # Production ran the side model with conf=DAMAGE_CONFIDENCE, so the
-        # confidence floor is applied at inference time (identical outcome).
-        try:
-            res = model(frame, verbose=False, half=HALF, device=DEVICE, conf=cam_conf)[0]
-        except Exception:
-            continue
-        if res.boxes is None or len(res.boxes) == 0:
-            continue
-        boxes = res.boxes.xyxy.cpu().numpy()
-        confs = res.boxes.conf.cpu().numpy()
-        clss = res.boxes.cls.cpu().numpy().astype(int)
-        for bbox, conf, cid in zip(boxes, confs, clss):
-            cname = str(names.get(int(cid), "")).lower()
-            rec = (fi, float(conf), float(bbox[0]), float(bbox[1]),
-                   float(bbox[2]), float(bbox[3]))
-            if cname == _CLASS_DOOR_OPEN:
-                open_dets.append(rec)
-            elif cname == _CLASS_DOOR_CLOSE:
-                close_dets.append(rec)
-            # 'damage' class is owned by the damage processor -- ignored here.
+    if CFG.FEATURE_BATCH_SIZE > 1:
+        open_dets, close_dets, used, frame_cache = _collect_door_batched(
+            model, cam_conf, interior)
+    else:
+        # === DEFAULT per-frame path -- VERBATIM pre-optimization behaviour ===
+        for p in interior:
+            frame = cv2.imread(p)
+            if frame is None:
+                continue
+            used += 1
+            fi = _parse_frame_index(p)
+            # Production ran the side model with conf=DAMAGE_CONFIDENCE, so the
+            # confidence floor is applied at inference time (identical outcome).
+            try:
+                res = model(frame, verbose=False, half=HALF, device=DEVICE, conf=cam_conf)[0]
+            except Exception:
+                continue
+            if res.boxes is None or len(res.boxes) == 0:
+                continue
+            boxes = res.boxes.xyxy.cpu().numpy()
+            confs = res.boxes.conf.cpu().numpy()
+            clss = res.boxes.cls.cpu().numpy().astype(int)
+            for bbox, conf, cid in zip(boxes, confs, clss):
+                cname = str(names.get(int(cid), "")).lower()
+                rec = (fi, float(conf), float(bbox[0]), float(bbox[1]),
+                       float(bbox[2]), float(bbox[3]))
+                if cname == _CLASS_DOOR_OPEN:
+                    open_dets.append(rec)
+                elif cname == _CLASS_DOOR_CLOSE:
+                    close_dets.append(rec)
+                # 'damage' class is owned by the damage processor -- ignored here.
 
     open_bands = _analyze_bands(open_dets, _BAND_GAP_TOLERANCE)
     close_bands = _analyze_bands(close_dets, _BAND_GAP_TOLERANCE)
@@ -290,8 +340,12 @@ def _process_wagon_camera_door(
     if evidence_root and winning is not None:
         best_fi = winning["best_frame"]
         best_bbox = winning["best_bbox"]
-        best_frame = read_cached_frame(
-            cache_root, gw_id, C.CAMERA_FOLDER[camera_id], best_fi)
+        # Reuse the already-decoded frame from the batched path (identical bytes);
+        # default path has an empty cache -> falls back to the original re-read.
+        best_frame = frame_cache.get(best_fi)
+        if best_frame is None:
+            best_frame = read_cached_frame(
+                cache_root, gw_id, C.CAMERA_FOLDER[camera_id], best_fi)
         if best_frame is not None:
             crop_img = safe_crop(best_frame, best_bbox, pad=12)
             with atomic_camera_evidence(evidence_root, gw_id, FEATURE_NAME,

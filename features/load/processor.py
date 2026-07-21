@@ -39,11 +39,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 
 from core import constants as C
+from core import config as CFG
 from core import production_models as PM
 from core.global_state_loader import GlobalTrainState
 
 from features._common import (
-    run_classification, list_wagon_frames,
+    run_classification, batched_classify, list_wagon_frames,
     write_per_wagon_json, empty_payload, FeatureTimer, feature_camera_dir,
 )
 from features._evidence import (
@@ -105,17 +106,12 @@ def _aggregate_camera(
     best_loaded = BestFrameTracker()
     best_empty = BestFrameTracker()
 
-    for p in frames:
-        frame = cv2.imread(p)
-        if frame is None:
-            continue
-        used += 1
-        cls, conf = run_classification(model, frame)
-        # Production gate: only confident predictions vote.
-        if conf < _CLASSIFICATION_CONFIDENCE:
-            continue
+    def _vote(fi, frame, cls, conf):
+        """Apply the production vote+best-frame update for one classified frame
+        (shared by the per-frame and batched paths so both are identical)."""
+        if conf < _CLASSIFICATION_CONFIDENCE:      # production gate: confident only
+            return
         canon = _canonical_load(cls)
-        fi = _parse_frame_index(p)
         if canon == C.LOAD_LOADED:
             loaded_confs.append(conf)
             best_loaded.update(score=float(conf), frame=frame, frame_idx=int(fi),
@@ -124,6 +120,45 @@ def _aggregate_camera(
             empty_confs.append(conf)
             best_empty.update(score=float(conf), frame=frame, frame_idx=int(fi),
                               camera_id=camera_id, class_name=cls, confidence=float(conf))
+
+    if CFG.FEATURE_BATCH_SIZE > 1:
+        # OPT-IN batched classification (validate parity before production use).
+        bs = CFG.FEATURE_BATCH_SIZE
+        for j in range(0, len(frames), bs):
+            fis: List[int] = []
+            frs: List[Any] = []
+            for p in frames[j:j + bs]:
+                fr = cv2.imread(p)
+                if fr is None:
+                    continue
+                fis.append(_parse_frame_index(p))
+                frs.append(fr)
+            if not frs:
+                continue
+            used += len(frs)
+            for fi, fr, (cls, conf) in zip(fis, frs, batched_classify(model, frs)):
+                _vote(fi, fr, cls, float(conf))
+    else:
+        # === DEFAULT per-frame path -- VERBATIM pre-optimization behaviour ===
+        for p in frames:
+            frame = cv2.imread(p)
+            if frame is None:
+                continue
+            used += 1
+            cls, conf = run_classification(model, frame)
+            # Production gate: only confident predictions vote.
+            if conf < _CLASSIFICATION_CONFIDENCE:
+                continue
+            canon = _canonical_load(cls)
+            fi = _parse_frame_index(p)
+            if canon == C.LOAD_LOADED:
+                loaded_confs.append(conf)
+                best_loaded.update(score=float(conf), frame=frame, frame_idx=int(fi),
+                                   camera_id=camera_id, class_name=cls, confidence=float(conf))
+            elif canon == C.LOAD_EMPTY:
+                empty_confs.append(conf)
+                best_empty.update(score=float(conf), frame=frame, frame_idx=int(fi),
+                                  camera_id=camera_id, class_name=cls, confidence=float(conf))
 
     n_loaded = len(loaded_confs)
     n_empty = len(empty_confs)

@@ -37,6 +37,7 @@ Output JSON shape:
 
 from __future__ import annotations
 
+import itertools
 import os
 import re
 import time
@@ -52,7 +53,7 @@ from core import production_models as PM
 from core.global_state_loader import GlobalTrainState
 
 from features._common import (
-    load_yolo, run_detection, iter_wagon_frames, crop_bbox,
+    load_yolo, run_detection, iter_wagon_frames, crop_bbox, batched_detect,
     write_per_wagon_json, empty_payload, FeatureTimer, feature_camera_dir,
     DEVICE, HALF,
 )
@@ -196,6 +197,41 @@ def _process_engine_loco(loco_model, ocr, cache_root: str, gw_id: str) -> Dict[s
 # Per-wagon driver
 # -----------------------------------------------------------------------------
 
+def _ocr_one_detection(ocr, aggregator, raw_candidates, best, fi, frame,
+                       bbox_list, yolo_conf):
+    """Stage B per-detection OCR pipeline (preprocess + easyocr + validate +
+    reconstruct + aggregate + best-frame).  Shared VERBATIM by the per-frame and
+    batched-detection paths so EasyOCR recognition is byte-identical -- only the
+    upstream YOLO *detection* is optionally batched."""
+    crop = crop_bbox(frame, bbox_list, pad=10)
+    if crop is None or crop.size == 0:
+        return
+    try:
+        wagon_num = ocr.reconstruct_wagon_number(crop, float(yolo_conf), debug=False)
+    except Exception:
+        return
+    if wagon_num is None:
+        return
+    aggregator.add_wagon_number(wagon_num, frame_idx=fi)
+    full = getattr(wagon_num, "full_number", None)
+    if full:
+        ocr_conf = float(getattr(wagon_num, "ocr_confidence", 0.0))
+        raw_candidates.append({
+            "frame_idx":       int(fi),
+            "full_number":     str(full),
+            "ocr_confidence":  ocr_conf,
+            "yolo_confidence": float(getattr(wagon_num, "yolo_confidence", 0.0)),
+            "bbox":            bbox_list,
+        })
+        # Track best snapshot: prefer full-length (11-digit) numbers, then conf.
+        is_full = int(len(str(full)) == C.WAGON_NUMBER_LENGTH)
+        score = is_full * 10.0 + ocr_conf
+        best.update(
+            score=score, frame=frame, bbox=bbox_list, frame_idx=fi,
+            full_number=str(full), ocr_confidence=ocr_conf,
+            yolo_confidence=float(yolo_conf), is_full_length=bool(is_full))
+
+
 def _process_one_wagon(
     yolo_model,
     ocr: WagonNumberOCR,
@@ -214,63 +250,47 @@ def _process_one_wagon(
     raw_candidates: List[Dict[str, Any]] = []
     best = BestFrameTracker()    # remembers the highest-conf OCR snapshot
 
-    for fi, frame in iter_wagon_frames(cache_root, gw_id, C.CAMERA_RIGHT_UP, trim_stable=True):
-        used += 1
-
-        # Stage A: YOLO detection -- locate wagon-number bbox regions
-        try:
-            # device-aware: FP16 on CUDA, FP32 on CPU (hardcoded half=True
-            # errors on a CPU-only host).
-            results = yolo_model(frame, verbose=False, half=HALF, device=DEVICE)[0]
-        except Exception:
-            continue
-        if results.boxes is None or len(results.boxes) == 0:
-            continue
-
-        boxes = results.boxes.xyxy.cpu().numpy()
-        confs = results.boxes.conf.cpu().numpy()
-
-        # Stage B: per-detection OCR pipeline (preprocess + easyocr +
-        # validate + reconstruct)
-        for bbox, yolo_conf in zip(boxes, confs):
-            if float(yolo_conf) < det_confidence:
-                continue
-            bbox_list = [float(b) for b in bbox]
-            crop = crop_bbox(frame, bbox_list, pad=10)
-            if crop is None or crop.size == 0:
-                continue
+    if CFG.FEATURE_BATCH_SIZE > 1:
+        # OPT-IN: batch ONLY the YOLO wagon-number DETECTION; EasyOCR recognition
+        # stays per-detection (same crops, same order) -> recognition unchanged.
+        gen = iter_wagon_frames(cache_root, gw_id, C.CAMERA_RIGHT_UP, trim_stable=True)
+        bs = CFG.FEATURE_BATCH_SIZE
+        while True:
+            chunk = list(itertools.islice(gen, bs))
+            if not chunk:
+                break
+            used += len(chunk)
+            frames = [fr for _, fr in chunk]
+            # confidence=None -> model's own default conf (== per-frame model(frame));
+            # the det_confidence (0.40) gate is applied below exactly as per-frame.
+            per = batched_detect(yolo_model, frames, confidence=None)
+            for (fi, frame), dets in zip(chunk, per):
+                for d in dets:
+                    yolo_conf = d["confidence"]
+                    if yolo_conf < det_confidence:
+                        continue
+                    _ocr_one_detection(ocr, aggregator, raw_candidates, best,
+                                       fi, frame, d["bbox"], float(yolo_conf))
+    else:
+        # === DEFAULT per-frame path -- VERBATIM pre-optimization behaviour ===
+        for fi, frame in iter_wagon_frames(cache_root, gw_id, C.CAMERA_RIGHT_UP, trim_stable=True):
+            used += 1
+            # Stage A: YOLO detection -- locate wagon-number bbox regions
             try:
-                wagon_num = ocr.reconstruct_wagon_number(
-                    crop, float(yolo_conf), debug=False,
-                )
+                results = yolo_model(frame, verbose=False, half=HALF, device=DEVICE)[0]
             except Exception:
                 continue
-            if wagon_num is None:
+            if results.boxes is None or len(results.boxes) == 0:
                 continue
-            aggregator.add_wagon_number(wagon_num, frame_idx=fi)
-
-            full = getattr(wagon_num, "full_number", None)
-            if full:
-                ocr_conf = float(getattr(wagon_num, "ocr_confidence", 0.0))
-                raw_candidates.append({
-                    "frame_idx":       int(fi),
-                    "full_number":     str(full),
-                    "ocr_confidence":  ocr_conf,
-                    "yolo_confidence": float(getattr(wagon_num, "yolo_confidence", 0.0)),
-                    "bbox":            bbox_list,
-                })
-                # Track best snapshot:  prefer full-length (11-digit) numbers
-                # and within that bucket, highest OCR confidence.
-                is_full = int(len(str(full)) == C.WAGON_NUMBER_LENGTH)
-                score = is_full * 10.0 + ocr_conf
-                best.update(
-                    score=score, frame=frame, bbox=bbox_list,
-                    frame_idx=fi,
-                    full_number=str(full),
-                    ocr_confidence=ocr_conf,
-                    yolo_confidence=float(yolo_conf),
-                    is_full_length=bool(is_full),
-                )
+            boxes = results.boxes.xyxy.cpu().numpy()
+            confs = results.boxes.conf.cpu().numpy()
+            # Stage B: per-detection OCR (preprocess + easyocr + validate)
+            for bbox, yolo_conf in zip(boxes, confs):
+                if float(yolo_conf) < det_confidence:
+                    continue
+                bbox_list = [float(b) for b in bbox]
+                _ocr_one_detection(ocr, aggregator, raw_candidates, best,
+                                   fi, frame, bbox_list, float(yolo_conf))
 
     # Stage C: pick the dominant aggregated wagon number
     aggregated = aggregator.get_aggregated_numbers()

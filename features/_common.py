@@ -149,6 +149,32 @@ def stable_interior(paths: List[str]) -> List[str]:
     return paths[k:len(paths) - k]
 
 
+# Directory-listing cache: the same wagon-cache dir is listed by several
+# features (e.g. door + side-damage both read RIGHT_UP/<gw>/; load + top-damage
+# both read the top dirs).  Caching the sorted glob per (dir, mtime_ns) turns
+# those redundant scans into a single stat -- byte-identical output, and mtime
+# invalidation means any materializer add/remove is picked up.  Thread-safe
+# (features run in parallel threads).  Default-on; alters no outputs.
+_LISTING_CACHE: Dict[str, Tuple[int, List[str]]] = {}
+_LISTING_LOCK = threading.Lock()
+
+
+def _cached_sorted_frames(d: str) -> List[str]:
+    try:
+        mtime = os.stat(d).st_mtime_ns
+    except OSError:
+        return []
+    with _LISTING_LOCK:
+        ent = _LISTING_CACHE.get(d)
+        if ent is not None and ent[0] == mtime:
+            return ent[1]
+    paths = glob.glob(os.path.join(d, "frame_*.jpg"))
+    paths.sort()
+    with _LISTING_LOCK:
+        _LISTING_CACHE[d] = (mtime, paths)
+    return paths
+
+
 def list_wagon_frames(
     cache_root: str, gw_id: str, camera_id: str,
     *, trim_stable: bool = False,
@@ -156,13 +182,14 @@ def list_wagon_frames(
     """Return sorted JPEG paths for one (gw, camera) pair.
 
     When ``trim_stable`` is True, returns only the adaptive stable interior
-    (5% per side, clamped [3, 12]) used for feature inference.
+    (5% per side, clamped [3, 12]) used for feature inference.  Listings are
+    cached per (dir, mtime) so repeat scans of the same wagon dir are avoided
+    (identical result).
     """
     d = wagon_camera_dir(cache_root, gw_id, camera_id)
     if not os.path.isdir(d):
         return []
-    paths = glob.glob(os.path.join(d, "frame_*.jpg"))
-    paths.sort()
+    paths = _cached_sorted_frames(d)
     if trim_stable:
         paths = stable_interior(paths)
     return paths
@@ -243,6 +270,184 @@ def run_detection(
             "bbox": [float(bbox[0]), float(bbox[1]),
                      float(bbox[2]), float(bbox[3])],
         })
+    return out
+
+
+def _parse_detection_result(res, names, confidence: float) -> List[Dict[str, Any]]:
+    """Parse ONE ultralytics Results into clean detection dicts (shared by the
+    per-frame and batched paths so both yield identical records)."""
+    if res is None or res.boxes is None or len(res.boxes) == 0:
+        return []
+    boxes = res.boxes.xyxy.cpu().numpy()
+    confs = res.boxes.conf.cpu().numpy()
+    clss = res.boxes.cls.cpu().numpy().astype(int)
+    out: List[Dict[str, Any]] = []
+    for bbox, conf, cls_id in zip(boxes, confs, clss):
+        if float(conf) < confidence:
+            continue
+        out.append({
+            "class_id": int(cls_id),
+            "class_name": str(names.get(int(cls_id), "unknown")).lower(),
+            "confidence": float(conf),
+            "bbox": [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
+        })
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Adaptive batch sizing (default FEATURE_BATCH_SIZE=32).  On an out-of-memory
+# condition the batch halves (32->16->8->4->2->1) and retries -- the pipeline
+# NEVER fails on OOM.  The reduced size is remembered PROCESS-WIDE (sticky) so
+# later wagons/cameras don't repeatedly hit OOM at the too-large size.
+# -----------------------------------------------------------------------------
+
+_effective_bs: Optional[int] = None
+_bs_lock = threading.Lock()
+
+
+def _is_oom(e: Exception) -> bool:
+    if isinstance(e, MemoryError):
+        return True
+    return "out of memory" in str(e).lower()
+
+
+def _free_cuda() -> None:
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _resolve_bs(requested: Optional[int]) -> int:
+    """Starting batch size.  Explicit `requested` (tests/callers) wins as-is;
+    otherwise use the sticky process-wide effective size (seeded from
+    CFG.FEATURE_BATCH_SIZE, only ever ratcheted DOWN by OOM)."""
+    if requested is not None:
+        return max(1, requested)
+    global _effective_bs
+    with _bs_lock:
+        if _effective_bs is None:
+            _effective_bs = max(1, CFG.FEATURE_BATCH_SIZE)
+        return _effective_bs
+
+
+def _ratchet_down(requested: Optional[int], cur: int) -> int:
+    """Halve the current chunk after an OOM; on the adaptive (requested is None)
+    path also lower the sticky process-wide size so future calls start smaller."""
+    new = max(1, cur // 2)
+    if requested is None:
+        global _effective_bs
+        with _bs_lock:
+            if _effective_bs is None or new < _effective_bs:
+                _effective_bs = new
+    _free_cuda()
+    return new
+
+
+def effective_batch_size() -> int:
+    """Current adaptive batch size (for processors' decode-chunking)."""
+    return _resolve_bs(None)
+
+
+def batched_detect(
+    model, frames: List[np.ndarray], *, confidence: Optional[float] = None,
+    batch_size: Optional[int] = None, half: Optional[bool] = None,
+    device: Optional[str] = None,
+) -> List[List[Dict[str, Any]]]:
+    """Run a YOLO DETECTION model over `frames`, returning ONE detection list per
+    frame IN INPUT ORDER.
+
+    confidence:
+      * a float -> passed to `model(..., conf=confidence)` (door/damage: their
+        per-camera threshold) AND used as the parse floor.  Matches the
+        per-frame processors that call `model(frame, conf=cam_conf)`.
+      * None    -> the model runs at its OWN default conf and NO parse floor is
+        applied; the caller filters (OCR: `model(frame)` then its own 0.40 gate).
+
+    batch_size: None -> core.config.FEATURE_BATCH_SIZE (default 1).
+      * <=1 -> EXACT per-frame path (byte-identical to the pre-opt processors).
+      * >1  -> `model([chunk], ...)`; on CUDA OOM the chunk halves and retries
+        down to 1 (never drops a frame).  Records are parsed by the SAME
+        `_parse_detection_result` in both paths, so bs=1 == per-frame exactly.
+    """
+    if model is None or not frames:
+        return [[] for _ in frames]
+    bs = _resolve_bs(batch_size)
+    dev = device if device is not None else DEVICE
+    use_half = HALF if half is None else half
+    names = getattr(model, "names", {}) or {}
+    floor = 0.0 if confidence is None else confidence
+
+    def _predict(imgs):
+        kw = dict(verbose=False, half=use_half, device=dev)
+        if confidence is not None:
+            kw["conf"] = confidence
+        return model(imgs, **kw)
+
+    if bs <= 1:
+        return [_parse_detection_result(_predict(fr)[0], names, floor) for fr in frames]
+
+    out: List[List[Dict[str, Any]]] = []
+    i, cur, n = 0, bs, len(frames)
+    while i < n:
+        chunk = frames[i:i + cur]
+        try:
+            for res in _predict(chunk):
+                out.append(_parse_detection_result(res, names, floor))
+            i += len(chunk)
+        except (RuntimeError, MemoryError) as e:
+            if cur > 1 and _is_oom(e):
+                cur = _ratchet_down(batch_size, cur)      # 32->16->8->4->2->1
+                continue
+            raise
+    return out
+
+
+def _parse_classification_result(res, names) -> Tuple[str, float]:
+    """Parse ONE ultralytics classification Results into (top1_name, conf) --
+    identical logic to run_classification (incl. the boxes fallback)."""
+    if getattr(res, "probs", None) is None:
+        if res.boxes is not None and len(res.boxes) > 0:
+            confs = res.boxes.conf.cpu().numpy()
+            clss = res.boxes.cls.cpu().numpy().astype(int)
+            i = int(np.argmax(confs))
+            return str(names.get(int(clss[i]), "unknown")).lower(), float(confs[i])
+        return "", 0.0
+    top1 = int(res.probs.top1)
+    conf = float(res.probs.top1conf)
+    return str(names.get(top1, "unknown")).lower(), conf
+
+
+def batched_classify(
+    model, frames: List[np.ndarray], *, batch_size: Optional[int] = None,
+    device: Optional[str] = None,
+) -> List[Tuple[str, float]]:
+    """Run a YOLO CLASSIFICATION model over `frames`, returning (class, conf) per
+    frame IN INPUT ORDER.  bs<=1 -> `model(frame)` per frame (== run_classification
+    exactly); bs>1 -> batched with CUDA-OOM halving.  No `half`/`conf` passed
+    (mirrors run_classification)."""
+    if model is None or not frames:
+        return [("", 0.0) for _ in frames]
+    bs = _resolve_bs(batch_size)
+    dev = device if device is not None else DEVICE
+    names = getattr(model, "names", {}) or {}
+    if bs <= 1:
+        return [_parse_classification_result(model(fr, verbose=False, device=dev)[0], names)
+                for fr in frames]
+    out: List[Tuple[str, float]] = []
+    i, cur, n = 0, bs, len(frames)
+    while i < n:
+        chunk = frames[i:i + cur]
+        try:
+            for res in model(chunk, verbose=False, device=dev):
+                out.append(_parse_classification_result(res, names))
+            i += len(chunk)
+        except (RuntimeError, MemoryError) as e:
+            if cur > 1 and _is_oom(e):
+                cur = _ratchet_down(batch_size, cur)      # 32->16->8->4->2->1
+                continue
+            raise
     return out
 
 
