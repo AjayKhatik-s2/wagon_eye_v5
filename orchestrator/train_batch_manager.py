@@ -166,8 +166,14 @@ def _list_input_objects(s3_client) -> List[Tuple[str, str, object, Optional[str]
             _WARNED_NO_PREFIXES = True
         return []
 
+    # Make the ACTUAL discovery source explicit in the logs -- bucket +
+    # prefixes -- so an env override (e.g. a stale WAGONEYE_S3_INPUT_BUCKET
+    # pinning discovery to the wrong bucket) is immediately visible instead of
+    # silently changing what gets read.
+    log.info("[DISCOVERY] input bucket=%s (%d prefix(es))", bucket, len(prefixes))
     out: List[Tuple[str, str, object, Optional[str]]] = []
     for prefix in prefixes:
+        log.info("[DISCOVERY] scanning prefix=%s", prefix)
         token = None
         while True:
             kwargs = {"Bucket": bucket, "Prefix": prefix.strip("/")}
