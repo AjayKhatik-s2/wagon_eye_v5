@@ -84,8 +84,16 @@ def _save_ledger(camera: str, processed: Set[str]) -> None:
 # -----------------------------------------------------------------------------
 
 def _list_raw_keys(ex, raw_bucket: str) -> List[str]:
-    """Sorted video keys under the camera's raw bucket/prefix."""
-    objs = ex.s3.list_objects(raw_bucket)
+    """Sorted video keys under the camera's raw bucket/prefix.
+
+    `raw_bucket` is a "<bucket>/<camera_folder>" string; we pass the embedded
+    camera folder as the S3 list Prefix so each camera lists ONLY its own raw
+    folder.  Without this the list would scan the whole raw bucket and every
+    camera would (mis)process every other camera's raw clips.
+    """
+    from .url_utils import split_bucket_prefix
+    _bucket, prefix = split_bucket_prefix(raw_bucket)
+    objs = ex.s3.list_objects(raw_bucket, prefix=prefix)
     keys = [o["Key"] for o in objs
             if str(o.get("Key", "")).lower().endswith(_VIDEO_EXTS)]
     return sorted(keys)

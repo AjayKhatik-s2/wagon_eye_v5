@@ -697,6 +697,60 @@ def _attach_candidate(cv, actives, processed, ctx, tolerance_sec):
     BM.save_s3(ctx.s3_client, target)
 
 
+def _extraction_sweep() -> Dict[str, Dict[str, int]]:
+    """Stage A (in-process): run ONE raw->trimmed extraction sweep of all four
+    cameras, then return.
+
+    This reuses the EXISTING extraction producer verbatim -- the same
+    `train_extraction.run_extraction_service.sweep_camera` the standalone
+    service runs -- so no extraction logic is duplicated or changed.  Calling it
+    at the top of each `--auto` poll tick (before complete-train discovery) is
+    what makes `master_runner --auto` a true single-process pipeline:
+
+        RAW bucket -> extraction/trim -> complete-train  (this function)
+        complete-train -> discovery -> lifecycle         (the rest of run_auto)
+
+    Fault tolerance: a per-camera failure (missing extraction model, S3 error,
+    a bad clip) is logged and the sweep continues to the next camera; the tick
+    then proceeds to discovery with whatever was produced, and the NEXT tick
+    retries.  The extractor's own per-camera ledger + S3 ongoing-state make
+    re-sweeps cheap and idempotent (an already-handled raw key is skipped), so
+    retrying never re-extracts or double-uploads a clip.
+    """
+    try:
+        from train_extraction import run_extraction_service as EXT
+        from train_extraction import driver as EXT_D
+    except Exception as e:
+        log.error("[EXTRACT] extraction package unavailable -- skipping raw sweep: %s",
+                  e, exc_info=True)
+        return {}
+
+    log.info("[RAW] scanning raw bucket for new clips (all 4 cameras) ...")
+    totals: Dict[str, Dict[str, int]] = {}
+    for camera in EXT_D.ALL_CAMERAS:
+        if _SHUTDOWN_REQUESTED:
+            log.info("[EXTRACT] shutdown requested -- stopping raw sweep")
+            break
+        log.info("[EXTRACT] %s sweep start", camera)
+        try:
+            r = EXT.sweep_camera(camera)          # list raw -> trim -> upload trimmed
+        except Exception as e:
+            log.error("[EXTRACT] %s sweep crashed (continuing): %s",
+                      camera, e, exc_info=True)
+            continue
+        totals[camera] = r
+        if r.get("trains"):
+            log.info("[UPLOAD] complete-train <- %s : %d trimmed clip(s) uploaded",
+                     camera, r["trains"])
+        log.info("[EXTRACT] %s done: listed=%d new=%d trains=%d errors=%d",
+                 camera, r.get("listed", 0), r.get("new", 0),
+                 r.get("trains", 0), r.get("errors", 0))
+    n_trains = sum(t.get("trains", 0) for t in totals.values())
+    log.info("[RAW] sweep complete: %d new trimmed clip(s) across %d camera(s)",
+             n_trains, len(totals))
+    return totals
+
+
 def run_auto(*args, **kwargs):
     """Continuous S3 polling loop -- manifest-driven, resumable, multi-batch.
 
@@ -728,6 +782,16 @@ def run_auto(*args, **kwargs):
     poll_interval = kwargs.get("poll_interval", 60)
     run_once      = kwargs.get("run_once", False)
     force_key     = kwargs.get("force_batch_key")
+    run_extraction = kwargs.get("run_extraction", CFG.AUTO_RUN_EXTRACTION)
+
+    if run_extraction and not force_key:
+        log.info("[ORCH] in-process extraction ENABLED -- this single process "
+                 "runs RAW -> trimmed -> complete-train -> reports (no separate "
+                 "extraction service needed). Disable with --skip-extraction or "
+                 "WAGONEYE_AUTO_RUN_EXTRACTION=false.")
+    else:
+        log.info("[ORCH] in-process extraction DISABLED -- polling complete-train "
+                 "only (expects a separate train_extraction producer).")
 
     ctx = LR.RunContext(
         workspace_root=workspace_root,
@@ -746,6 +810,13 @@ def run_auto(*args, **kwargs):
 
     while not _SHUTDOWN_REQUESTED:
         try:
+            # ---- Stage A: RAW -> trimmed extraction FIRST (never bypass it) ----
+            # Runs before complete-train discovery so the correct order holds:
+            #   RAW bucket -> extraction -> complete-train -> discovery -> lifecycle.
+            # Skipped for --batch replay (force_key) and when extraction is off.
+            if run_extraction and not force_key:
+                _extraction_sweep()
+
             actives = {m.batch_key: m for m in
                        BM.list_active_manifests(s3, processed_batches=processed)}
 
@@ -865,6 +936,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--partial-wait",     type=float, default=30.0)
     p.add_argument("--skip-upload",      action="store_true")
     p.add_argument("--skip-email",       action="store_true")
+    p.add_argument("--skip-extraction",  action="store_true",
+                   help="do NOT run the in-process raw->trimmed extraction sweep "
+                        "in --auto (poll complete-train only; use this if a "
+                        "separate train_extraction producer service is running)")
     p.add_argument("--disable-features", default="",
                    help="comma-separated feature keys to turn OFF "
                         "(door,ocr,load,damage); skips the interactive prompt")
@@ -938,6 +1013,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         force_batch_key=args.batch,
         skip_upload=args.skip_upload,
         skip_email=args.skip_email,
+        run_extraction=(not args.skip_extraction) and CFG.AUTO_RUN_EXTRACTION,
         feature_config=feature_config,
     )
 
