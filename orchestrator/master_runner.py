@@ -800,8 +800,9 @@ def run_auto(*args, **kwargs):
                  "extraction service needed). Disable with --skip-extraction or "
                  "WAGONEYE_AUTO_RUN_EXTRACTION=false.")
     else:
-        log.info("[ORCH] in-process extraction DISABLED -- polling complete-train "
-                 "only (expects a separate train_extraction producer).")
+        log.info("[ORCH] in-process extraction DISABLED -- INSPECTION-ONLY: polling "
+                 "input bucket %s (a separate instance performs extraction; this "
+                 "process never reads the raw bucket).", C.S3_INPUT_BUCKET)
 
     ctx = LR.RunContext(
         workspace_root=workspace_root,

@@ -213,15 +213,16 @@ ACTIVE_BATCH_POLL_INTERVAL = int(_env_float("WAGONEYE_ACTIVE_BATCH_POLL_INTERVAL
 # IGNORE (default) -> log + drop; the sealed report is never reopened.
 LATE_CAMERA_POLICY = _env_str("WAGONEYE_LATE_CAMERA_POLICY", "IGNORE").upper()
 
-# Single-process end-to-end: when `master_runner --auto` runs, also perform the
-# raw->trimmed extraction sweep IN-PROCESS at the top of each poll tick (before
-# complete-train discovery), so ONE `--auto` process owns the whole
-# RAW -> extraction -> complete-train -> processing flow and no separate
-# train_extraction producer service is required.  Set to false to run the
-# classic two-service topology (a standalone train_extraction.run_extraction_service
-# producer feeding the trimmed bucket).  The `--skip-extraction` CLI flag
-# overrides this to false for a single run.
-AUTO_RUN_EXTRACTION = _env_bool("WAGONEYE_AUTO_RUN_EXTRACTION", True)
+# Extraction topology.  In the FINALIZED production architecture train
+# extraction runs on a SEPARATE instance and uploads complete-train clips into
+# the input bucket; THIS instance is INSPECTION-ONLY and must NOT extract.  So
+# the default is FALSE: `master_runner --auto` polls the input bucket and never
+# touches the raw bucket, never initializes an extractor, and never downloads
+# extraction models (the whole extraction sweep is skipped -- see
+# master_runner._extraction_sweep, which is the only place any of that happens).
+# Set true (single-instance topology only) to have ONE `--auto` process also run
+# raw->trimmed extraction in-process.  `--skip-extraction` forces it off.
+AUTO_RUN_EXTRACTION = _env_bool("WAGONEYE_AUTO_RUN_EXTRACTION", False)
 
 # Automatic model synchronization: when a required model (.pt) is missing
 # locally, core.model_sync downloads it from the models bucket (constants.

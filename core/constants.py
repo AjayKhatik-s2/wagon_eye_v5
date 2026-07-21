@@ -157,10 +157,14 @@ DAMAGE_CLASSES_NEGATIVE = {"no_damage"}
 # S3 storage architecture (2026 migration).  Every value is overridable via a
 # WAGONEYE_* environment variable.  Three buckets, strictly separated:
 #
-#   RAW      biro-wagon-raw-video-copy   raw camera recordings only (extraction IN)
-#   TRIMMED  complete-train              trimmed complete-train clips
-#                                        (extraction OUT == inspection IN);
-#                                        laid out per camera folder.
+#   RAW      biro-wagon-raw-video-copy   raw camera recordings only (extraction IN;
+#                                        used ONLY by the separate extraction
+#                                        instance -- this inspection instance never
+#                                        reads it).
+#   INPUT    biro-wagon-pre-processed-   COMPLETE-TRAIN clips produced by the
+#            video-copy                  separate extraction instance == inspection
+#                                        IN; laid out per camera folder.  This
+#                                        instance polls ONLY this bucket.
 #   OUTPUT   end-results                 ALL inspection outputs, under three
 #                                        purpose prefixes + the processed-batches
 #                                        state file:
@@ -171,22 +175,29 @@ DAMAGE_CLASSES_NEGATIVE = {"no_damage"}
 #                                            global_state, wagon_states, metadata)
 #                                          processed_batches.json    (duplicate guard)
 #
-# master_runner --auto reads ONLY the TRIMMED bucket; it never reads RAW.
+# master_runner --auto reads ONLY the INPUT bucket; it never reads RAW.
 # -----------------------------------------------------------------------------
 
 S3_REGION = _env("WAGONEYE_S3_REGION", "ap-south-1")
 
 # --- buckets ---
+# RAW bucket is consumed only by the SEPARATE extraction instance; this
+# inspection instance never reads it (extraction is disabled by default here --
+# see config.AUTO_RUN_EXTRACTION).
 S3_RAW_BUCKET     = _env("WAGONEYE_S3_RAW_BUCKET", "biro-wagon-raw-video-copy")
-S3_TRIMMED_BUCKET = _env("WAGONEYE_S3_TRIMMED_BUCKET", "complete-train")
+# The bucket the external extraction instance uploads COMPLETE-TRAIN clips to,
+# and the ONLY bucket this instance polls.
+S3_TRIMMED_BUCKET = _env("WAGONEYE_S3_TRIMMED_BUCKET", "biro-wagon-pre-processed-video-copy")
 S3_OUTPUT_BUCKET  = _env("WAGONEYE_S3_OUTPUT_BUCKET", "end-results")
 
-# Inspection input == the trimmed bucket (master_runner --auto polls THIS, never RAW).
+# Inspection input == the pre-processed bucket (master_runner --auto polls THIS,
+# never RAW).  Override with WAGONEYE_S3_INPUT_BUCKET.
 S3_INPUT_BUCKET = _env("WAGONEYE_S3_INPUT_BUCKET", S3_TRIMMED_BUCKET)
-# Comma-separated camera folders under the trimmed bucket the poller scans.
+# Comma-separated camera folders under the input bucket the poller scans.
+# Override with WAGONEYE_S3_INPUT_PREFIXES (comma/semicolon separated).
 S3_INPUT_PREFIXES = _env_list("WAGONEYE_S3_INPUT_PREFIXES", [
-    "camera_CCTV_HZBN_DHN_1_LEFT_UP/",
     "camera_CCTV_HZBN_DHN_2_RIGHT_UP/",
+    "camera_CCTV_HZBN_DHN_3_LEFT_UP/",
     "camera_CCTV_HZBN_DHN_5_RIGHT_TOP/",
     "camera_CCTV_HZBN_DHN_6_LEFT_TOP/",
 ])
