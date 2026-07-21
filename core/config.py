@@ -223,6 +223,13 @@ LATE_CAMERA_POLICY = _env_str("WAGONEYE_LATE_CAMERA_POLICY", "IGNORE").upper()
 # overrides this to false for a single run.
 AUTO_RUN_EXTRACTION = _env_bool("WAGONEYE_AUTO_RUN_EXTRACTION", True)
 
+# Automatic model synchronization: when a required model (.pt) is missing
+# locally, core.model_sync downloads it from the models bucket (constants.
+# S3_MODELS_BUCKET, default wagon-eye-models) before it is loaded, so a fresh
+# host needs no manual model copy.  A present model is always an instant no-op.
+# Set false to require models to be pre-staged on disk (the pre-sync behaviour).
+MODEL_SYNC_ENABLED = _env_bool("WAGONEYE_MODEL_SYNC_ENABLED", True)
+
 
 # -----------------------------------------------------------------------------
 # Startup configuration validation + redacted summary
@@ -311,6 +318,7 @@ def startup_summary(*, mode: str) -> str:
         f"  email_interim_reports    : {EMAIL_INTERIM_REPORTS}",
         f"  late_camera_policy       : {LATE_CAMERA_POLICY}",
         f"  auto_run_extraction      : {AUTO_RUN_EXTRACTION} (in-process RAW->trimmed)",
+        f"  model_sync_enabled       : {MODEL_SYNC_ENABLED} (bucket={C.S3_MODELS_BUCKET})",
         f"  poll_interval_s          : {ACTIVE_BATCH_POLL_INTERVAL}",
         f"  s3_raw_bucket            : {C.S3_RAW_BUCKET}",
         f"  s3_trimmed_bucket        : {C.S3_TRIMMED_BUCKET}",

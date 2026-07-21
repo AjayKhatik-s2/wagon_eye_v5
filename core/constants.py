@@ -200,6 +200,14 @@ S3_ARCHIVE_PREFIX   = _env("WAGONEYE_S3_ARCHIVE_PREFIX", "archive")
 # root so it lives alongside reports/ dashboard/ archive/.
 S3_STATE_KEY = _env("WAGONEYE_S3_STATE_KEY", "processed_batches.json")
 
+# --- model registry bucket ---
+# Weights (.pt) are pulled from here on demand by core.model_sync whenever a
+# required model is missing locally (extraction / reconstruction / production
+# feature models).  Objects are stored flat by basename
+# (s3://wagon-eye-models/<name>.pt); S3_MODELS_PREFIX prepends a key prefix if set.
+S3_MODELS_BUCKET = _env("WAGONEYE_MODELS_S3_BUCKET", "wagon-eye-models")
+S3_MODELS_PREFIX = _env("WAGONEYE_MODELS_S3_PREFIX", "")
+
 # DEPRECATED (pre-migration single-prefix layout `train_batch/<key>/...`).
 # Retained only so an env override that still sets it does not error; NO code
 # path uses it after the migration -- reports/dashboard/archive prefixes replace

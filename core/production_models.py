@@ -87,8 +87,16 @@ def _rel(filename: str) -> str:
 
 
 def resolve(filename: str) -> str:
-    """Absolute path a production model *should* live at (no existence check)."""
-    return os.path.join(CFG.PROD_MODELS_DIR, filename)
+    """Absolute path a production model lives at, ensuring it is present locally.
+
+    If the file is missing, core.model_sync transparently downloads it from the
+    models bucket (wagon-eye-models) before returning; a present model is an
+    instant no-op.  On a sync failure the (still-missing) path is returned so
+    require() raises MissingProductionModel exactly as before -- the loader's
+    behaviour is unchanged, only the file is now fetched on demand."""
+    path = os.path.join(CFG.PROD_MODELS_DIR, filename)
+    from core import model_sync  # lazy: avoids any import-time cost / cycle
+    return model_sync.ensure_local(path)
 
 
 def require(filename: str) -> str:

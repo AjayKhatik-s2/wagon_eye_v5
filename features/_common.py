@@ -60,6 +60,11 @@ def load_yolo(model_path: str):
     Patches `torch.load` once on first call so .pt weights load on
     torch >= 2.6 (the same monkey-patch used by wagon_count).
     """
+    # Transparent sync: pull the weight from the models bucket if it is missing
+    # locally (no-op when already present).  Loading behaviour below is unchanged.
+    if model_path:
+        from core import model_sync
+        model_sync.ensure_local(model_path)
     if not model_path or not os.path.isfile(model_path):
         return None
 

@@ -725,6 +725,16 @@ def _extraction_sweep() -> Dict[str, Dict[str, int]]:
                   e, exc_info=True)
         return {}
 
+    # Ensure the extraction classifier models are present locally (pull from the
+    # models bucket on a fresh host) BEFORE building any extractor -- done here at
+    # the orchestrator boundary so the standalone train_extraction package needs
+    # no change and no core import.  A present model is an instant no-op.
+    try:
+        from core import model_sync
+        model_sync.ensure_extraction_models()
+    except Exception as e:
+        log.error("[MODEL] extraction model sync error (continuing to sweep): %s", e)
+
     log.info("[RAW] scanning raw bucket for new clips (all 4 cameras) ...")
     totals: Dict[str, Dict[str, int]] = {}
     for camera in EXT_D.ALL_CAMERAS:

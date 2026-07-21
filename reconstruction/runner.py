@@ -132,6 +132,17 @@ def run(
         if not os.path.exists(p):
             raise ReconstructionError(f"Video for {cam} does not exist: {p}")
 
+    # Ensure the reconstruction weights are present locally, pulling any missing
+    # ones from the models bucket (wagon-eye-models) BEFORE the standalone
+    # wagon_count subprocess -- which cannot import core -- resolves them by name.
+    # A present model is a no-op; a failed sync leaves the dir as-is so the
+    # existing "models dir does not exist / model not found" errors still fire.
+    try:
+        from core import model_sync
+        model_sync.ensure_reconstruction_models(reconstruction_models_dir)
+    except Exception as e:  # never let sync bookkeeping fail the stage
+        log.warning("[STAGE1] reconstruction model sync error (continuing): %s", e)
+
     if not os.path.isdir(reconstruction_models_dir):
         raise ReconstructionError(
             f"reconstruction_models_dir does not exist: "
