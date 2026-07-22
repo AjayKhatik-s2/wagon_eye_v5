@@ -892,10 +892,15 @@ def run_local(
     feat_models_dir: str,
     feature_config: Optional[FeatureConfig] = None,
 ) -> int:
+    local_inputs = os.path.abspath(os.path.expanduser(local_inputs))
     if not os.path.isdir(local_inputs):
         log.error("ERROR: %s does not exist", local_inputs)
         return 2
+    log.info("[LOCAL] scanning input dir: %s", local_inputs)
     video_paths = scan_local_video_dir(local_inputs)
+    log.info("[LOCAL] discovered %d/%d cameras: %s",
+             len(video_paths), len(C.ALL_CAMERAS),
+             {c: os.path.basename(p) for c, p in video_paths.items()})
     missing = [c for c in C.ALL_CAMERAS if c not in video_paths]
     if missing:
         log.error("ERROR: missing videos for %s in %s.", missing, local_inputs)

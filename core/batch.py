@@ -110,13 +110,22 @@ def build_local_batch(
 # -----------------------------------------------------------------------------
 
 def scan_local_video_dir(local_dir: str) -> Dict[str, str]:
-    """Find one video per camera by camera-name substring (case-insensitive)."""
+    """Find one video per camera by camera-name substring (case-insensitive).
+
+    Returns ABSOLUTE paths.  This is load-bearing: Stage 1 runs
+    wagon_count/run_global_count.py as a subprocess with ``cwd=wagon_count/``,
+    so a relative path (e.g. from ``--local-inputs local_inputs``) would be
+    re-anchored under wagon_count/ inside the child and resolve to nothing --
+    the child then reports ``present: []`` and exits 4.  Anchoring to absolute
+    here makes discovery independent of any downstream working directory.
+    """
     import glob
 
+    local_dir = os.path.abspath(os.path.expanduser(local_dir))
     candidates: List[str] = []
     for ext in ("*.mp4", "*.MP4", "*.avi", "*.AVI", "*.mov", "*.MOV"):
         candidates.extend(glob.glob(os.path.join(local_dir, "**", ext), recursive=True))
-    candidates = sorted(set(candidates))
+    candidates = sorted(set(os.path.abspath(p) for p in candidates))
 
     found: Dict[str, str] = {}
     # Longest camera name first so RIGHT_UP_TOP wins over RIGHT_UP
