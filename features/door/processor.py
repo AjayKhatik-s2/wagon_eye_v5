@@ -60,7 +60,7 @@ from features._common import (
 )
 from features._evidence import (
     atomic_camera_evidence, read_cached_frame,
-    save_jpeg, safe_crop, write_metadata, draw_annotated_bbox,
+    save_jpeg, safe_crop, write_metadata, draw_evidence_annotation,
 )
 
 
@@ -350,10 +350,11 @@ def _process_wagon_camera_door(
             crop_img = safe_crop(best_frame, best_bbox, pad=12)
             with atomic_camera_evidence(evidence_root, gw_id, FEATURE_NAME,
                                         camera_id) as ev_tmp:
-                annotated = draw_annotated_bbox(
+                annotated = draw_evidence_annotation(
                     best_frame, best_bbox,
                     label=f"{reported_class.upper()} {conf:.2f}",
                     color=evidence_color,
+                    gw_id=gw_id, camera_id=camera_id, frame_idx=int(best_fi),
                 )
                 save_jpeg(os.path.join(ev_tmp, f"{side}_best.jpg"), annotated)
                 if crop_img is not None:

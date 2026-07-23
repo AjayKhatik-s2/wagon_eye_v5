@@ -153,6 +153,63 @@ def draw_annotated_bbox(
     return out
 
 
+def draw_evidence_annotation(
+    frame: np.ndarray,
+    bbox: List[float],
+    *,
+    label: str,
+    color: tuple = (0, 255, 255),
+    gw_id: str = "",
+    camera_id: str = "",
+    frame_idx: int = -1,
+    thickness: int = 2,
+) -> np.ndarray:
+    """Draw a full inspector-verification annotation on a COPY of the frame.
+
+    This is a pure visualization overlay -- it never changes any detection,
+    threshold, band, selection, or JSON.  It draws exactly what the spec asks
+    an inspector to see so they can confirm the defect belongs to the right
+    wagon, on top of the defect box the feature processor already computed:
+
+        * the defect bounding box + its ``label`` (class + confidence), coloured
+          per the feature (unchanged from ``draw_annotated_bbox``);
+        * a wagon-extent border (the wagon_cache frame IS one wagon's
+          temporally-segmented view, so the wagon "tracking box" is the frame);
+        * a top context banner: ``<GW_ID>  |  <CAMERA>  |  frame <N>``.
+
+    All inputs (gw_id, camera_id, frame_idx, bbox, label) are values the caller
+    already has in hand -- no extra decode, no extra inference.
+    """
+    if frame is None:
+        return frame
+    out = frame.copy()
+    h, w = out.shape[:2]
+
+    # --- wagon-extent border (thin, neutral) ---
+    cv2.rectangle(out, (1, 1), (w - 2, h - 2), (200, 200, 200), 1)
+
+    # --- defect bounding box + label (same look as draw_annotated_bbox) ---
+    if bbox is not None and len(bbox) == 4:
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
+        if label:
+            cv2.putText(out, label, (x1, max(0, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+
+    # --- top context banner (filled strip so text is legible over any frame) ---
+    ctx_parts = [p for p in (gw_id, camera_id,
+                             (f"frame {frame_idx}" if frame_idx is not None
+                              and frame_idx >= 0 else "")) if p]
+    if ctx_parts:
+        banner = "  |  ".join(ctx_parts)
+        (tw, th), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        bar_h = th + 12
+        cv2.rectangle(out, (0, 0), (min(w, tw + 16), bar_h), (0, 0, 0), -1)
+        cv2.putText(out, banner, (8, bar_h - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+    return out
+
+
 def write_metadata(path: str, payload: Dict[str, Any]) -> None:
     """Atomically write a JSON metadata file (temp + os.replace)."""
     d = os.path.dirname(os.path.abspath(path)) or "."

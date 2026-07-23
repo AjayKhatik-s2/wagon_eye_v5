@@ -53,7 +53,7 @@ from features._common import (
 )
 from features._evidence import (
     atomic_camera_evidence, read_cached_frame,
-    save_jpeg, safe_crop, write_metadata, draw_annotated_bbox,
+    save_jpeg, safe_crop, write_metadata, draw_evidence_annotation,
 )
 
 
@@ -305,10 +305,12 @@ def _process_wagon_camera_damage(
                                               C.CAMERA_FOLDER[camera_id], d["best_frame_idx"])
                 if frame is None:
                     continue
-                annotated = draw_annotated_bbox(
+                annotated = draw_evidence_annotation(
                     frame, d["bbox"],
                     label=f"{d['class_name']} {d['best_confidence']:.2f}",
-                    color=_color_for(d["class_name"]))
+                    color=_color_for(d["class_name"]),
+                    gw_id=gw_id, camera_id=camera_id,
+                    frame_idx=int(d["best_frame_idx"]))
                 save_jpeg(os.path.join(ev_tmp, f"track_{i}.jpg"), annotated)
                 crop_img = safe_crop(frame, d["bbox"], pad=10)
                 if crop_img is not None:
@@ -430,9 +432,11 @@ def _process_wagon_camera_side_damage(
                                               d["best_frame_idx"])
                 if frame is None:
                     continue
-                annotated = draw_annotated_bbox(
+                annotated = draw_evidence_annotation(
                     frame, d["bbox"], label=f"DAMAGE {d['best_confidence']:.2f}",
-                    color=_COLOR_SIDE_DAMAGE)
+                    color=_COLOR_SIDE_DAMAGE,
+                    gw_id=gw_id, camera_id=camera_id,
+                    frame_idx=int(d["best_frame_idx"]))
                 save_jpeg(os.path.join(ev_tmp, f"track_{i}.jpg"), annotated)
                 crop_img = safe_crop(frame, d["bbox"], pad=10)
                 if crop_img is not None:

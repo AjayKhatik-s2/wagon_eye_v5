@@ -280,6 +280,24 @@ def _draw_event_banner(frame, events: List[Dict[str, Any]]) -> None:
         y_offset += 30
 
 
+def _draw_context_hud(frame, camera_id: str, gw_id: str, frame_idx: int) -> None:
+    """Bottom-left inspector HUD: camera name + wagon id (+ frame number).
+
+    Visualization-only, additive to the legacy annotations (kept clear of the
+    top-left legacy event/info blocks).  ``gw_id`` is looked up from the existing
+    wagon->frame map; blank between wagons.  Never invokes any model."""
+    parts = [camera_id]
+    if gw_id:
+        parts.append(gw_id)
+    parts.append(f"f{frame_idx}")
+    text = "  ".join(parts)
+    h = frame.shape[0]
+    (tw, th), _ = cv2.getTextSize(text, _FONT, 0.6, 2)
+    y0 = h - th - 12
+    cv2.rectangle(frame, (0, y0), (tw + 16, h), (0, 0, 0), -1)
+    cv2.putText(frame, text, (8, h - 8), _FONT, 0.6, (255, 255, 255), 2)
+
+
 def _draw_damage_info(frame, frame_idx: int, n_damages: int, frame_class: str) -> None:
     """Clone of the legacy green top-left damage info block."""
     info_lines = [
@@ -365,14 +383,14 @@ def _render_one_camera(
     is_side = camera_id in C.SIDE_CAMERAS
     is_top  = camera_id in C.TOP_CAMERAS
 
-    # The legacy top-camera info block prints the wagon TYPE; map frame -> wagon
-    # class for that line only (side cameras don't draw it).
+    # Map frame -> wagon for BOTH: the legacy top-camera info block (wagon TYPE)
+    # and the additive inspector HUD (wagon id, all cameras).  Pure arithmetic
+    # over the sealed state; no model, no decode.
     frame_to_wagon: Dict[int, GlobalWagon] = {}
-    if is_top:
-        for w in state.wagons:
-            sf, ef = _map_wagon_to_local_frames(w, src_fps, total)
-            for f in range(sf, ef + 1):
-                frame_to_wagon[f] = w
+    for w in state.wagons:
+        sf, ef = _map_wagon_to_local_frames(w, src_fps, total)
+        for f in range(sf, ef + 1):
+            frame_to_wagon[f] = w
 
     overlay = _OverlayRegistry(
         camera_id=camera_id, evidence_root=evidence_root, wagons=state.wagons,
@@ -407,6 +425,12 @@ def _render_one_camera(
             w = frame_to_wagon.get(frame_idx)
             frame_class = str(w.classification).upper() if w else "WAGON"
             _draw_damage_info(frame, frame_idx, n_damages, frame_class)
+
+        # Additive inspector HUD (camera + wagon id + frame) -- lets a viewer
+        # confirm which wagon each drawn defect box belongs to.
+        _hud_w = frame_to_wagon.get(frame_idx)
+        _draw_context_hud(frame, camera_id,
+                          _hud_w.global_id if _hud_w else "", frame_idx)
 
         writer.write(frame)
         written += 1
