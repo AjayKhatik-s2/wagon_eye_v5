@@ -44,6 +44,18 @@ from . import _evidence_lookup as ev
 
 _REPORT_SCHEMA = "wagon_eye.combined_report.v4"
 
+# ---------------------------------------------------------------------------
+# Reference-parity flags.  The combined PDF is a faithful port of the reference
+# combined_report.py design (navy banner -> VIDEO EVIDENCE -> PARTIAL warning ->
+# DETAILED REPORTS -> INSPECTION SUMMARY -> WAGON INSPECTION table -> Damaged
+# Wagon Report).  These two flags gate WagonEye-only presentation extras that
+# the reference layout does NOT contain, so the default output matches the
+# reference structure exactly (7-column wagon table; sections 1-7 only).  Flip
+# either to True to re-enable the richer WagonEye-native presentation; neither
+# affects the JSON, detection, reconstruction, fusion, or business logic.
+INCLUDE_CLASS_COLUMN = False          # extra "CLASS" column in the wagon table
+INCLUDE_MULTI_ANGLE_SECTION = False   # extra 2x2 per-wagon multi-angle pages
+
 
 # -----------------------------------------------------------------------------
 # Time helpers
@@ -315,7 +327,7 @@ def _build_pdf(
             ))
 
     report_data = [
-        [Paragraph("<b>DETAILED CAMERA REPORTS</b>", styles["SectionTitleWhite"]),
+        [Paragraph("<b>DETAILED REPORTS</b>", styles["SectionTitleWhite"]),
          "", "", ""],
         [Paragraph(f"<b>{C.CAMERA_LEFT_UP}</b>",      styles["CameraLabel"]),
          Paragraph(f"<b>{C.CAMERA_RIGHT_UP}</b>",     styles["CameraLabel"]),
@@ -453,14 +465,16 @@ def _build_pdf(
     _wagon_table = _build_wagon_table(vm, styles, missing_cameras)
     elements.append(_wagon_table)
 
-    # ----- 6b. MULTI-ANGLE WAGON EVIDENCE (wagon-centric, all 4 cameras) -----
-    multi_angle = _build_multi_angle_section(
-        state=state, unified=unified,
-        evidence_root=evidence_root, cache_root=cache_root,
-        styles=styles, missing_cameras=missing_cameras,
-    )
-    if multi_angle:
-        elements.extend(multi_angle)
+    # ----- 6b. MULTI-ANGLE WAGON EVIDENCE (WagonEye extra; not in the reference
+    # layout -- gated OFF by default for reference parity) -----
+    if INCLUDE_MULTI_ANGLE_SECTION:
+        multi_angle = _build_multi_angle_section(
+            state=state, unified=unified,
+            evidence_root=evidence_root, cache_root=cache_root,
+            styles=styles, missing_cameras=missing_cameras,
+        )
+        if multi_angle:
+            elements.extend(multi_angle)
 
     # ----- 7. DAMAGED WAGON REPORT (evidence pages) -----
     evidence_blocks = _build_evidence_section(
@@ -485,11 +499,20 @@ def _build_wagon_table(vm: _adapter.LegacyViewModel, styles, missing_cameras):
     from reportlab.platypus import Paragraph, Table, TableStyle
 
     NO_FEED_TEXT = "⚠ NO FEED"
-    # Column layout: SR(0) WAGON#(1) CLASS(2) LEFT(3) RIGHT(4) R-TOP(5) L-TOP(6) TYPE(7)
+    # Reference layout (INCLUDE_CLASS_COLUMN=False, default -- 7 cols):
+    #   SR(0) WAGON#(1) LEFT(2) RIGHT(3) R-TOP(4) L-TOP(5) TYPE(6)
+    # WagonEye layout (INCLUDE_CLASS_COLUMN=True -- 8 cols, adds CLASS):
+    #   SR(0) WAGON#(1) CLASS(2) LEFT(3) RIGHT(4) R-TOP(5) L-TOP(6) TYPE(7)
+    include_class = INCLUDE_CLASS_COLUMN
+    base = 3 if include_class else 2          # index of the first (LEFT) camera col
     cam_col = {
-        C.CAMERA_LEFT_UP: 3, C.CAMERA_RIGHT_UP: 4,
-        C.CAMERA_RIGHT_UP_TOP: 5, C.CAMERA_LEFT_UP_TOP: 6,
+        C.CAMERA_LEFT_UP:      base,
+        C.CAMERA_RIGHT_UP:     base + 1,
+        C.CAMERA_RIGHT_UP_TOP: base + 2,
+        C.CAMERA_LEFT_UP_TOP:  base + 3,
     }
+    n_cols = base + 5                          # 7 (reference) or 8 (with CLASS)
+    id_span_end = base - 1                     # last identity col for 1-issue highlight
     missing_cols = {cam_col[c] for c in missing_cameras if c in cam_col}
 
     col_header_p = ParagraphStyle(
@@ -514,12 +537,14 @@ def _build_wagon_table(vm: _adapter.LegacyViewModel, styles, missing_cameras):
     )
 
     title_row = [Paragraph("<b>WAGON INSPECTION DETAILS</b>",
-                            styles["SectionTitleWhite"]),
-                 "", "", "", "", "", "", ""]
+                            styles["SectionTitleWhite"])] + [""] * (n_cols - 1)
     header_row = [
         Paragraph("SR.NO",               col_header_p),
         Paragraph("WAGON NUMBER",        col_header_p),
-        Paragraph("CLASS",               col_header_p),
+    ]
+    if include_class:
+        header_row.append(Paragraph("CLASS", col_header_p))
+    header_row += [
         Paragraph("LEFT CAMERA<br/>DOORS",  col_header_p),
         Paragraph("RIGHT CAMERA<br/>DOORS", col_header_p),
         Paragraph("R-TOP<br/>DAMAGES",   col_header_p),
@@ -535,15 +560,17 @@ def _build_wagon_table(vm: _adapter.LegacyViewModel, styles, missing_cameras):
         wn = wagon.get("ocr_wagon_number") or "-"
         wn_disp = wn if wn != "-" else "-"
 
-        has_l = wagon.get("has_open_left")     and 2 not in missing_cols
-        has_r = wagon.get("has_open_right")    and 3 not in missing_cols
-        has_t = wagon.get("has_open_top")      and 4 not in missing_cols
-        has_lt = wagon.get("has_open_left_top") and 5 not in missing_cols
+        lc, rc, tc, ltc = (cam_col[C.CAMERA_LEFT_UP], cam_col[C.CAMERA_RIGHT_UP],
+                           cam_col[C.CAMERA_RIGHT_UP_TOP], cam_col[C.CAMERA_LEFT_UP_TOP])
+        has_l = wagon.get("has_open_left")      and lc not in missing_cols
+        has_r = wagon.get("has_open_right")     and rc not in missing_cols
+        has_t = wagon.get("has_open_top")       and tc not in missing_cols
+        has_lt = wagon.get("has_open_left_top") and ltc not in missing_cols
 
-        l_text = NO_FEED_TEXT if 2 in missing_cols else wagon.get("left_doors_text",  "NO DATA")
-        r_text = NO_FEED_TEXT if 3 in missing_cols else wagon.get("right_doors_text", "NO DATA")
-        t_text = NO_FEED_TEXT if 4 in missing_cols else wagon.get("top_doors_text",   "NO DATA")
-        lt_text = NO_FEED_TEXT if 5 in missing_cols else wagon.get("left_top_doors_text", "NO DATA")
+        l_text = NO_FEED_TEXT if lc in missing_cols else wagon.get("left_doors_text",  "NO DATA")
+        r_text = NO_FEED_TEXT if rc in missing_cols else wagon.get("right_doors_text", "NO DATA")
+        t_text = NO_FEED_TEXT if tc in missing_cols else wagon.get("top_doors_text",   "NO DATA")
+        lt_text = NO_FEED_TEXT if ltc in missing_cols else wagon.get("left_top_doors_text", "NO DATA")
 
         wt_text = wagon.get("wagon_type", "-")
         if wt_text == "LOADED":
@@ -570,36 +597,39 @@ def _build_wagon_table(vm: _adapter.LegacyViewModel, styles, missing_cameras):
         else:
             cls_style = cell_b
 
-        l_s = issue if has_l else (nofeed if 3 in missing_cols else cell)
-        r_s = issue if has_r else (nofeed if 4 in missing_cols else cell)
-        t_s = issue if has_t else (nofeed if 5 in missing_cols else cell)
-        lt_s = issue if has_lt else (nofeed if 6 in missing_cols else cell)
+        l_s = issue if has_l else (nofeed if lc in missing_cols else cell)
+        r_s = issue if has_r else (nofeed if rc in missing_cols else cell)
+        t_s = issue if has_t else (nofeed if tc in missing_cols else cell)
+        lt_s = issue if has_lt else (nofeed if ltc in missing_cols else cell)
 
-        rows.append([
+        row_cells = [
             Paragraph(f"<b>{sr}</b>", cell_b),
             Paragraph(f"<b>{wn_disp}</b>", cell_b) if wn_disp != "-" else Paragraph(wn_disp, cell),
-            Paragraph(cls_disp, cls_style),
+        ]
+        if include_class:
+            row_cells.append(Paragraph(cls_disp, cls_style))
+        row_cells += [
             Paragraph(l_text, l_s),
             Paragraph(r_text, r_s),
             Paragraph(t_text, t_s),
             Paragraph(lt_text, lt_s),
             Paragraph(wt_text, wt_style),
-        ])
+        ]
+        rows.append(row_cells)
 
-        issue_cols = []
-        if has_l:  issue_cols.append(3)
-        if has_r:  issue_cols.append(4)
-        if has_t:  issue_cols.append(5)
-        if has_lt: issue_cols.append(6)
+        issue_cols = [c for c, h in ((lc, has_l), (rc, has_r), (tc, has_t), (ltc, has_lt)) if h]
         if issue_cols:
             highlight_info.append((row_idx, issue_cols))
 
-    t = Table(
-        rows,
-        colWidths=[0.5*inch, 1.3*inch, 1.0*inch, 1.9*inch, 1.9*inch,
-                   0.9*inch, 0.9*inch, 0.9*inch],
-        repeatRows=2,
-    )
+    if include_class:
+        # WagonEye 8-col layout (SR, WAGON#, CLASS, LEFT, RIGHT, R-TOP, L-TOP, TYPE)
+        col_widths = [0.5*inch, 1.3*inch, 1.0*inch, 1.9*inch, 1.9*inch,
+                      0.9*inch, 0.9*inch, 0.9*inch]
+    else:
+        # Reference 7-col layout (SR, WAGON#, LEFT, RIGHT, R-TOP, L-TOP, TYPE)
+        col_widths = [0.5*inch, 1.5*inch, 2.0*inch, 2.0*inch,
+                      1.0*inch, 1.0*inch, 1.0*inch]
+    t = Table(rows, colWidths=col_widths, repeatRows=2)
     style = [
         ("SPAN", (0, 0), (-1, 0)),
         ("BACKGROUND", (0, 0), (-1, 0), _brand.NAVY_MID),
@@ -634,7 +664,7 @@ def _build_wagon_table(vm: _adapter.LegacyViewModel, styles, missing_cameras):
         if len(issue_cols) >= 2:
             style.append(("BACKGROUND", (0, row_idx), (-1, row_idx), _brand.ISSUE_BG))
         else:
-            style.append(("BACKGROUND", (0, row_idx), (2, row_idx), _brand.ISSUE_BG))
+            style.append(("BACKGROUND", (0, row_idx), (id_span_end, row_idx), _brand.ISSUE_BG))
             for col in issue_cols:
                 style.append(("BACKGROUND", (col, row_idx), (col, row_idx), _brand.ISSUE_BG))
     t.setStyle(TableStyle(style))
